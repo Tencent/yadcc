@@ -1,0 +1,124 @@
+// Copyright (C) 2020 THL A29 Limited, a Tencent company. All rights reserved.
+//
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this
+// file except in compliance with the License. You may obtain a copy of the
+// License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+syntax = "proto3";
+
+package yadcc.cache;
+
+enum Status {
+  STATUS_UNKNOWN = 0;  // Placeholder for flare::rpc::STATUS_SUCCESS.
+
+  STATUS_NOT_FOUND = 1001;      // The requested cache entry is not found.
+  STATUS_ACCESS_DENIED = 1002;  // Invalid token?
+  STATUS_INVALID_ARGUMENT = 1003;
+}
+
+message FetchBloomFilterRequest {
+  // Token of the requestor. The cache server only accepts request from clients
+  // that present a recognized token.
+  string token = 3;
+
+  // Seconds elapsed since last fetch of entire bloom filter.
+  uint32 seconds_since_last_full_fetch = 1;
+
+  // Seconds elapsed since last bloom filter fetcher, either full or
+  // incremental.
+  uint32 seconds_since_last_fetch = 2;
+}
+
+message FetchBloomFilterResponse {
+  // If set, a list of new keys are provided, otherwise, the entire bloom filter
+  // is returned via attachment.
+  bool incremental = 1;
+
+  ///////////////////////////////////
+  // Set if `incremental` is set.  //
+  ///////////////////////////////////
+
+  // Keys of newly populated cache entries.
+  repeated string newly_populated_keys = 2;
+
+  ///////////////////////////////////////
+  // Set if `incremental` is not set.  //
+  ///////////////////////////////////////
+
+  // Number of hash values generated for each key.
+  uint32 num_hashes = 3;
+}
+
+message TryGetEntryRequest {
+  string token = 2;
+
+  // Key of cache entry.
+  string key = 1;
+}
+
+message TryGetEntryResponse {
+  // NOTHING. On success, the cached entry is returned via attachment.
+}
+
+message PutEntryRequest {
+  string token = 2;
+
+  string key = 1;
+
+  // Value is provided via attachment.
+}
+
+message PutEntryResponse {
+  // NOTHING.
+}
+
+service CacheService {
+  // To speed up compilation cache lookup, the daemon should periodically call
+  // this method to load the Bloom Filter for detecting cache entry existance.
+  //
+  // Although technically feasible, always unconditionally looking up the cache
+  // before compilation can actually *hurt* performance. The reason is simple:
+  // so long as the build toolchain does work correctly, re-compilation of
+  // untouched file should be rare (ignoring users who clean up their workspace
+  // frequently). Therefore, unless the same file is compiled by others
+  // beforehand, cache is likely to *miss*. Because looking up cache (in Redis)
+  // incurs network delay, overall perf. can decrease.
+  //
+  // OTOH, consider that a large repository is shared by multiple users (given
+  // its real human or continuous integration scripts). In this case it's likely
+  // the same file is compiled multiple times by different user: e.g., someone
+  // compiled it locally, pushed into to Git, and subsequently fetched by a
+  // bunch of users who later compile it. In this regard, caching *should* speed
+  // things up to a certain degree.
+  //
+  // To take the best of both world, the scheduler maintain a Bloom Filter for
+  // detecting definite cache miss, and suggest the daemon to lookup the cache
+  // if it will likely to hit.
+  //
+  // Note that, to save bandwidth, this method may returns an incremental list
+  // of keys instead of a full bloom filter.
+  rpc FetchBloomFilter(FetchBloomFilterRequest)
+      returns (FetchBloomFilterResponse);
+
+  // Try read a cache entry with the specified cache key.
+  //
+  // Not sure if a batch interface would be beneficial here. If we choose to
+  // batch requests / responses, we can return a big attachment and pass offset
+  // of each cache entry in attachment via response message. This saves us from
+  // having Protocol Buffers to serialize a (really big) byte stream.
+  rpc TryGetEntry(TryGetEntryRequest) returns (TryGetEntryResponse);
+
+  // Save a cache result.
+  //
+  // The caller is responsible for compressing the value before saving it to
+  // cache.
+  rpc PutEntry(PutEntryRequest) returns (PutEntryResponse);
+}

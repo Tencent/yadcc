@@ -1,0 +1,39 @@
+// Copyright (C) 2020 THL A29 Limited, a Tencent company. All rights reserved.
+//
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this
+// file except in compliance with the License. You may obtain a copy of the
+// License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+syntax = "proto3";
+
+package yadcc.daemon;
+
+// Defines some meta data about a compilation cache. For the compilation result
+// (i.e., object file), it's stored immediately after this message.
+message CacheMeta {
+  // Note that even if we cache failure result, the only exit code we should be
+  // using is 0 (success) and 1 (failure). Any other exit code likely comes from
+  // non-compilation errors.
+  int32 exit_code = 3;
+
+  // I'm not sure how can it happen, yet I did see some `stderr` contains
+  // non-utf8 byte sequence. So we use `bytes` instead of `string` here.
+  bytes standard_output = 1;
+  bytes standard_error = 2;
+
+  // BLAKE3 of object file. This helps us to detect data corruption on network
+  // (or bug in our cache server implementation.).
+  //
+  // I'm not sure if we should use a cryptographical hash algorithm here. Given
+  // that the digest is used only to detect non-malicious data corruption, a
+  // cryptograhical hash algorithm may be a overkill?
+  bytes object_file_digest = 4;
+}

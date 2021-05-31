@@ -1,0 +1,83 @@
+// Copyright (C) 2020 THL A29 Limited, a Tencent company. All rights reserved.
+//
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this
+// file except in compliance with the License. You may obtain a copy of the
+// License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+syntax = "proto3";
+
+package yadcc.daemon.local;
+
+// Messages here are used to serialize request (as JSON) for calling our HTTP
+// interfaces. @sa: `README.md`
+
+message GetVersionRequest {
+  // NOTHING.
+}
+
+message GetVersionResponse {
+  string built_at = 1;
+}
+
+message AcquireQuotaRequest {
+  uint32 milliseconds_to_wait = 1;
+
+  // Whether the client is expecting running this task would run quickly. The
+  // daemon may decide to allow such tasks even if all processors are already
+  // occupied (over-provisioning).
+  //
+  // This is necessary to prevent too many long-running tasks (e.g., local
+  // retry) from blocking light tasks such as preprocessing. By giving
+  // preprocessing a higher priority, we can submit tasks to the cloud more
+  // quickly. (i.e., QoS of local tasks.)
+  bool lightweight_task = 2;
+
+  // The caller should provide its PID here. If it crashed unexpectedly, the
+  // delegate daemon can automatically reclaim the quota allocated to this
+  // requestor when this PID cease to exist.
+  uint32 requestor_pid = 3;
+}
+
+message AcquireQuotaResponse {
+  // Nothing. Check out HTTP status code for operation result.
+
+  // 200: Quota granted.
+  // 503: Timeout reached before a quota is available.
+}
+
+message ReleaseQuotaRequest {
+  uint32 requestor_pid = 1;
+}
+
+message ReleaseQuotaResponse {
+  // Nothing. Check out HTTP status code for operation result.
+}
+
+// Not used. See `README.md` for more details.
+message SubmitTaskRequest {}
+
+message SubmitTaskResponse {
+  string task_id = 1;
+}
+
+message WaitForTaskRequest {
+  string task_id = 1;
+  uint32 milliseconds_to_wait = 2;
+}
+
+message WaitForTaskResponse {
+  int32 exit_code = 1;
+  string output = 2;  // stdout
+  string error = 3;   // stderr
+}
+
+// No `service` is required here, see `README.md` for how to use this
+// IDL file.

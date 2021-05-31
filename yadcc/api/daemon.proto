@@ -1,0 +1,211 @@
+// Copyright (C) 2020 THL A29 Limited, a Tencent company. All rights reserved.
+//
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this
+// file except in compliance with the License. You may obtain a copy of the
+// License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+syntax = "proto3";
+
+import "yadcc/api/env_desc.proto";
+
+package yadcc.daemon.cloud;
+
+// Message exchanged between (local) daemon and client (compiler wrapper) are
+// NOT defined here.
+//
+// The reason is that we do not use Flare to implement out client. Flare does
+// not initialize itself fast enough. Usually initializing Flare takes 100s of
+// milliseconds. This does little harm to long-running services. However, our
+// client acts as a compiler wrapper, and thus, it's extremely sensitive to
+// start-up time.
+//
+// Therefore, our client is written specifically in a way that avoids
+// introducing too many dependencies, and simply uses libcurl to queue
+// compilation tasks for distribution via HTTP.
+//
+// @sa: `daemon/local/README.md` if you're interested in interfaces provided to
+// the client.
+
+//////////////////////////////////////////////////////////
+// Everything below is exchanged between daemons only.  //
+//////////////////////////////////////////////////////////
+
+// @sa: `RpcClientController.ErrorCode()``
+enum Status {
+  STATUS_UNKNOWN = 0;  // `rpc.STATUS_SUCCESS`, actually.
+  // Values less than 1000 is reserved by Flare.
+
+  // This is different from `STATUS_OVERLOADED`. If this status valus is
+  // returned, the situation is still managable, and there is no need to kick
+  // this node from the compiler cluster.
+  STATUS_HEAVILY_LOADED = 1001;
+
+  // Not quite possible but if the daemon does not recognize the requested
+  // compilation environment, this error can be returned.
+  STATUS_ENVIRONMENT_NOT_AVAILABLE = 1002;
+
+  // Token invalid?
+  STATUS_ACCESS_DENIED = 1003;
+}
+
+enum CompressionAlgorithm {
+  COMPRESSION_ALGORITHM_UNKNOWN = 0;
+
+  // Not supported yet. Unlikely to be supported in the future, either.
+  COMPRESSION_ALGORITHM_NONE = 1;
+
+  // Prefered.
+  COMPRESSION_ALGORITHM_ZSTD = 2;
+}
+
+enum CompilationTaskStatus {
+  COMPILATION_TASK_STATUS_UNKNOWN = 0;
+
+  // Failed to run the compiler.
+  COMPILATION_TASK_STATUS_FAILED = 1;
+
+  // The compiler is running.
+  COMPILATION_TASK_STATUS_RUNNING = 2;
+
+  // Compilation is done, either successfully or with an error.
+  COMPILATION_TASK_STATUS_DONE = 3;
+
+  // The task ID is unknown to us.
+  COMPILATION_TASK_STATUS_NOT_FOUND = 4;
+};
+
+message QueueCompilationTaskRequest {
+  string token = 6;  // Obtained from `scheduler.GetConfig`.
+
+  // Grant for running this task. This ID is allocated by the scheduler.
+  uint64 task_grant_id = 3;
+
+  // TODO(luobogao): We need a signature from the scheduler to test its
+  // validity. The scheduler can provide its public key in heartbeat response.
+  //
+  // This also resolve the issue that authentication is not applied on task
+  // submission. So long as we verified scheduler's signature, and the scheduler
+  // does verification of client's token correctly, we can be sure that the
+  // client is verified.
+  //
+  // Don't simply verify client's token instead. Using a signature from
+  // scheduler allows us to do more refined scheduling algorithm at the
+  // scheduler side, and signature enforces the algorithm.
+  //
+  // bytes scheduler_signature = 6;
+
+  // Desired compilation environment.
+  EnvironmentDesc env_desc = 1;
+
+  // Path of the source to be compiled.
+  string source_path = 5;
+
+  // Neither `gcc` nor `g++` would appear here. Given that `-x XXX` (i.e.,
+  // source language) is provided, whether we'll be calling `gcc` or `g++` is
+  // not significant.
+  string invocation_arguments = 2;
+
+  // Algorithm for compressing the preprocessed source code.
+  uint32 compression_algorithm = 4;  // @sa: CompressionAlgorithm
+
+  // If set, we won't fill the cache on completion. (TODO(luobogao): Not
+  // implemented yet.)
+  bool disallow_cache_fill = 7;
+
+  // See attchment for preprocessed source code.
+}
+
+message QueueCompilationTaskResponse {
+  uint64 task_id = 1;
+  uint32 status = 2;  // Hard coded to `COMPILATION_TASK_STATUS_RUNNING`.
+}
+
+message WaitForCompilationOutputRequest {
+  string token = 4;  // Obtained from `scheduler.GetConfig`.
+
+  uint64 task_id = 1;
+  uint32 milliseconds_to_wait = 2;  // Up to 10s.
+  repeated uint32 acceptable_compression_algorithms = 3 [packed = true];
+}
+
+message WaitForCompilationOutputResponse {
+  uint32 status = 1;  // @sa: CompilationTaskStatus
+
+  // If `status` is COMPILATION_TASK_STATUS_DONE`, the following fields are
+  // available.
+
+  // Compiler exit code.
+  int32 exit_code = 2;
+
+  // Whatever written to `stdout` / `stderr` by the compiler.
+  //
+  // I have no idea why, yet these two fields can contain non-utf8 characters.
+  // Therefore `string` may not be used here.
+  bytes output = 5;
+  bytes error = 3;
+
+  // Algorithm for compressing the object file (compilation result).
+  //
+  // TODO(luobogao): Not implemented yet. As I observes it, compressing the
+  // result should be profitable, just as compressing preprocessed source code.
+  uint32 compression_algorithm = 4;  // @sa: CompressionAlgorithm Always `NONE`.
+
+  // Compilation output is attached as attachment.
+}
+
+message FreeTaskRequest {
+  string token = 2;  // Obtained from `scheduler.GetConfig`.
+
+  uint64 task_id = 1;
+}
+
+message FreeTaskResponse {
+  // NOTHING.
+}
+
+service DaemonService {
+  // Queue a compilation task.
+  //
+  // The execution of this task might be delayed if the daemon is suffering from
+  // a temporarily overload. In case there are already too many tasks queued,
+  // this method may reject further tasks actively.
+  //
+  // Depending on how long the compilation takes, this method may return before
+  // the compilation actually completes (always the case at the moment). If this
+  // is the case, you can use `WaitForCompilationOutput` to get the compilation
+  // output later.
+  rpc QueueCompilationTask(QueueCompilationTaskRequest)
+      returns (QueueCompilationTaskResponse);
+
+  // For compilation task that takes a long time, `QueueCompilationTask` can
+  // complete before compilation itself completes. This is required to avoid RPC
+  // timeout.
+  //
+  // In this case, task ID returned by `QueueCompilationTask` can be used to
+  // query compilation result (in long-polling fashion) until the compilation
+  // itself actually completes.
+  //
+  // TODO(luobogao): Make this method act in "batch" way, so that it can wait
+  // for any pending tasks submitted by the caller.
+  rpc WaitForCompilationOutput(WaitForCompilationOutputRequest)
+      returns (WaitForCompilationOutputResponse);
+
+  // Free resources related to task.
+  //
+  // Note that even if this method is not called. The daemon would free
+  // completed tasks that has completed for a certain period. Well-behaving
+  // daemons should call this to free others' resources timely.
+  //
+  // The reason why we don't do this in `WaitForCompilationOutput` is for
+  // handling possible RPC failure. If we free the task there and that RPC
+  // fails, the compilation resource we devoted to this task is wasted.
+  rpc FreeTask(FreeTaskRequest) returns (FreeTaskResponse);
+}

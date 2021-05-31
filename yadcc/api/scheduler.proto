@@ -1,0 +1,314 @@
+// Copyright (C) 2020 THL A29 Limited, a Tencent company. All rights reserved.
+//
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this
+// file except in compliance with the License. You may obtain a copy of the
+// License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+syntax = "proto3";
+
+import "yadcc/api/env_desc.proto";
+
+package yadcc.scheduler;
+
+// TODO(luobogao): Some of the following status code are quite common, and can
+// be defined in Flare to be shared by all services.
+enum Status {
+  STATUS_UNKNOWN = 0;  // `rpc.STATUS_SUCCESS`, actually.
+  // Values less than 1000 are reserved by Flare.
+
+  // The entire system is under heavy load, and no quota can be allocated to the
+  // caller.
+  STATUS_NO_QUOTA_AVAILABLE = 1001;
+  STATUS_NOT_IMPLEMENTED = 1002;
+  STATUS_ACCESS_DENIED = 1003;  // Invalid token?
+  STATUS_INVALID_ARGUMENT = 1004;
+  STATUS_VERSION_TOO_OLD = 1005;  // Daemon should be upgraded.
+}
+
+// Defines priority when selecting servant. The scheduler usually prefer to
+// assign task to servant with higher priority.
+enum ServantPriority {
+  SERVANT_PRIORITY_UNKNOWN = 0;
+
+  // Dedicated servant. QoS of them are somewhat guaranteed.
+  SERVANT_PRIORITY_DEDICATED = 1;
+
+  // Users who volunteer their CPUs (if not otherwise ruled out by other
+  // factors. @sa: `NotAcceptingTaskReason`.)
+  SERVANT_PRIORITY_USER = 2;
+}
+
+// @sa: Enumeration with the same name in `daemon/cloud/execution_engine.h`.
+enum NotAcceptingTaskReason {
+  NOT_ACCEPTING_TASK_REASON_UNKNOWN = 0;
+  NOT_ACCEPTING_TASK_REASON_USER_INSTRUCTED = 1;
+  NOT_ACCEPTING_TASK_REASON_POOR_MACHINE = 2;
+  NOT_ACCEPTING_TASK_REASON_CGROUPS_PRESENT = 3;
+  NOT_ACCEPTING_TASK_REASON_BEHIND_NAT = 4;
+}
+
+message HeartbeatRequest {
+  // The scheduler only accepts requests carrying a recognized token.
+  string token = 13;
+
+  // Expected time of next heartbeat.
+  uint32 next_heartbeat_in_ms = 7;  // An interval less than 10s is suggested.
+
+  //////////////////////////////////////
+  // Basic facts about this servant.  //
+  //////////////////////////////////////
+
+  // Version of this daemon.
+  uint32 version = 11;
+
+  // IP:port of the reporting servant.
+  string location = 1;
+
+  // Number of processors.
+  uint32 num_processors = 10;
+
+  // Current load average
+  uint32 current_load = 4;
+
+  //////////////////////////////////////////////
+  // Facts about capability of this servant.  //
+  //////////////////////////////////////////////
+
+  ServantPriority servant_priority = 14;
+
+  // The reason why `capacity` is zero.
+  NotAcceptingTaskReason not_accepting_task_reason = 12;
+
+  // Maximum number of task concurrency this node is willing to provide.
+  uint32 capacity = 3;
+
+  // Total memory of this node.
+  uint64 total_memory_in_bytes = 15;
+
+  // Available memory.
+  uint64 memory_available_in_bytes = 16;
+
+  // Compilers recognizes by this servant.
+  repeated EnvironmentDesc env_descs = 6;
+
+  /////////////////////////////
+  // State of this servant.  //
+  /////////////////////////////
+
+  // IDs of running tasks on this servant. This is the grant ID allocated by the
+  // scheduler, not some task ID allocated by daemon or the client itself.
+  repeated uint64 running_tasks = 5 [packed = true];
+
+  //////////////////////////////////
+  // Date to report to scheduler. //
+  //////////////////////////////////
+}
+
+message HeartbeatResponse {
+  // Tokens that should be accepted by this daemon. This is in no way related to
+  // the token provided in the request. This one is used for accessing daemons,
+  // while the latter is used for accessing scheduler.
+  //
+  // Usually there's only one entry in this list. There can be more if we're
+  // rolling out a new one.
+  //
+  // The delegate daemon periodically requests a token from the scheduler via
+  // `GetConfig`
+  repeated string acceptable_tokens = 2;
+
+  // IDs in `running_tasks` of the request that the scheduler think is dead.
+  // Usually this means the task submitter failed to sent keep-alive in a timely
+  // manner.
+  //
+  // The caller is free to instantly terminate tasks listed here without further
+  // negotiation.
+  repeated uint64 expired_tasks = 1 [packed = true];
+}
+
+message GetConfigRequest {
+  string token = 1;  // Token to access scheduler.
+}
+
+message GetConfigResponse {
+  string serving_daemon_token = 1;  // Token to access other daemons.
+}
+
+// Describes the reason why a task grant is acquired.
+enum StartingTaskReason {
+  STARTING_TASK_REASON_UNKNOWN = 0;
+  STARTING_TASK_REASON_NORMAL = 1;
+  STARTING_TASK_REASON_PREFETCH = 2;
+}
+
+message StartingTaskApplication {
+  // Only servant who is able to provide such environment is returned.
+
+  uint32 reason = 1;  // @sa: StartingTaskReason
+}
+
+// Describes a newly-allocated task quota.
+message StartingTaskGrant {
+  // ID allocated to this task. You will need this to invoke renew operation.
+  //
+  // For the moment this ID is allocated as a monotonically increasing number
+  // sequence. Perhaps using a 128-bit random number would help in mitigating
+  // collision attack?
+  //
+  // Note that the daemons do not verify each other's token, they solely relies
+  // on what's provided by the scheduler (e.g., this ID, and (if implemented)
+  // scheduler's signature) to be safe.
+  uint64 task_grant_id = 1;
+
+  // Physical location of this node. (IP:port)
+  string servant_location = 2;
+}
+
+message WaitForStartingTaskRequest {
+  string token = 6;
+
+  // Milliseonds the caller would like to wait before the scheduler fails this
+  // request with `STATUS_NO_QUOTA_AVAILABLE`.
+  //
+  // This value is NOT the same as RPC timeout. The latter should be greater
+  // than this timeout.
+  uint32 milliseconds_to_wait = 1;  // An duration less than 10s is suggested.
+
+  // Tasks grant requested.
+  EnvironmentDesc env_desc = 2;
+  uint32 immediate_reqs = 3;
+  uint32 prefetch_reqs = 4;
+
+  // The caller should call `KeepTaskAlive` in this time period.
+  uint32 next_keep_alive_in_ms = 5;  // An interval less than 10s is suggested.
+}
+
+message WaitForStartingTaskResponse {
+  // Quota allocated to the caller.
+  //
+  // Note that this array does not need to have exactly `desired_quota`
+  // elements. If the system is under heavy load, this method can return with
+  // less quota than requested.
+  repeated StartingTaskGrant grants = 1;
+}
+
+message KeepTaskAliveRequest {
+  string token = 6;
+
+  repeated uint64 task_grant_ids = 1 [packed = true];
+
+  // The caller should call `KeepTaskAlive` again in this time period.
+  uint32 next_keep_alive_in_ms = 5;  // An interval less than 10s is suggested.
+}
+
+message KeepTaskAliveResponse {
+  repeated bool statuses = 1 [packed = true];
+}
+
+message FreeTaskRequest {
+  string token = 2;
+
+  repeated uint64 task_grant_ids = 1 [packed = true];
+}
+
+message FreeTaskResponse {}
+
+message RunningTask {
+  uint64 task_id = 1;
+  string servant_location = 2;
+  EnvironmentDesc env_desc = 3;
+  string invocation_arguments = 4;
+  string source_digest = 5;
+}
+
+message NotifyTaskStartRequest {
+  uint64 task_grant_id = 1;
+  RunningTask task = 2;
+}
+
+message NotifyTaskStartResponse {
+  // NOTHING.
+}
+
+message NotifyTaskStatusChangeRequest {
+  uint64 task_grant_id = 1;
+  uint32 status = 2;
+}
+
+message NotifyTaskStatusChangeResponse {
+  // NOTHING.
+}
+
+message GetRunningTasksRequest {
+  // NOTHING.
+}
+
+message GetRunningTasksResponse {
+  repeated RunningTask running_tasks = 1;
+}
+
+service SchedulerService {
+  //////////////////////////////////////////////////////
+  // Called by serving daemon (compilation servant).  //
+  //////////////////////////////////////////////////////
+
+  // Called periodically by daemons to report their states.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  //////////////////////////////////////////////////
+  // Called by delegate daemon (task submitter).  //
+  //////////////////////////////////////////////////
+
+  // Called periodically to obtain configurations such token to access other
+  // serving daemons.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+  // Apply for distributing one or more compilation tasks. This method returns a
+  // list of servant to do actual compilation.
+  //
+  // Unless there's no quota available, this method never blocks. However, this
+  // method can return less quota than requested if the system under heavy load.
+  //
+  // Each grant can be applied to exactly one compilation task. If the client
+  // believes it has more task to run in the near future, it can "prefetch" some
+  // quota.
+  rpc WaitForStartingTask(WaitForStartingTaskRequest)
+      returns (WaitForStartingTaskResponse);
+
+  // For long-running compilation tasks. The grant (or, "lease", if that terms
+  // makes you feel better) timeout set in the initial request is likely to be
+  // too short. In this case the client should renew its grant periodically by
+  // calling this method.
+  rpc KeepTaskAlive(KeepTaskAliveRequest) returns (KeepTaskAliveResponse);
+
+  // The daemon should call this after it finishes its compilation to return the
+  // quota to global quota pool.
+  //
+  // Failing to call this method is not catastrophic, though. So long as the
+  // client does not renew its grant inefinitely, the grant will expire sooner
+  // or later. Once the grant expires, we're back to normal.
+  //
+  //   Actually I believe the scheduler and the servant can cooperate to drop a
+  //   grant actively once the compilation is done. This way we don't have to
+  //   count on client not to keep renewing its least to work correctly.
+  //
+  // Well-behaved client should pair this call with its acquisition.
+  rpc FreeTask(FreeTaskRequest) returns (FreeTaskResponse);
+
+  // Notify compile task started.
+  rpc NotifyTaskStart(NotifyTaskStartRequest) returns (NotifyTaskStartResponse);
+
+  // Notify compile task status changed.
+  rpc NotifyTaskStatusChange(NotifyTaskStatusChangeRequest)
+      returns (NotifyTaskStatusChangeResponse);
+
+  // Get all running compile tasks.
+  rpc GetRunningTasks(GetRunningTasksRequest) returns (GetRunningTasksResponse);
+}
