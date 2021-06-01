@@ -94,12 +94,12 @@ LLVM 项目：
 
 - 16C 开发机本地 8 并发：2时18分17秒
 - ccache+distcc, -j144：44分23秒
-- 76C高性能开发机 -j80：25分18秒
+- 76C 高性能开发机，-j80：25分18秒
 - yadcc：9分25秒
 
 详情参见[性能测试对比](yadcc/doc/benchmark.md)。
 
-总体而言，`yadcc`应当有相当明显的性能优势。
+总体而言，`yadcc` 有相当明显的性能优势。
 
 ## 相关项目
 
@@ -113,8 +113,8 @@ LLVM 项目：
 - https://docs.bazel.build/versions/master/remote-caching.html Google Bazel 远程缓存协议，有多个实现，只支持 Bazel 或支持该协议的构建系统
 - https://bazel.build/remote-execution-services.html Google Bazel 远程执行协议，有多个实现，只支持 Bazel 或支持该协议的构建系统
 
-比较而言，Bazel 相关的两个协议是非跨构建系统的；distcc 缺乏统一的调度，其他几个只是编译缓存；icecream 是和 yadcc 最接近的，也是我们一开始试用的目标，不过在并行数百个任务时，表现未达到预期。
+比较而言，Bazel 相关的两个协议是非跨构建系统的，只能用于 Bazel 或者支持这些协议的构建系统；distcc 缺乏统一的调度；其他几个只是编译缓存；icecream 是和 yadcc 最接近的，也是我们一开始尝试使用的，不过在并行数百个任务时，性能和稳定性表现不佳。
 
-我们才开发了 yadcc，除了提供更好的性能和可靠性外，还额外增加了一些其他功能。
+因此我们才开发了 yadcc，除了提供更好的性能和可靠性外，还额外增加了一些其他功能。
 
 Yadcc 是我们目前已知的内置缓存机制的通用分布式编译系统。
