@@ -1,6 +1,6 @@
 # Yadcc 分布式 C++ 编译器
 
-`yadcc`是一套腾讯广告自研的工业级C++分布式编译系统。目前在我们1700+核的集群中每天编译300,0000+个目标文件，产出约3~5TB，已经持续稳定运营 8 个月。
+`Yadcc`是一套腾讯广告自研的工业级C++分布式编译系统。目前在我们1700+核的集群中每天编译300,0000+个目标文件，产出约3~5TB，已经持续稳定运营 8 个月。
 
 2021 年 6 月，正式对外开源。
 
@@ -18,10 +18,12 @@
 
 和[`ccache`](https://ccache.dev)、[`distcc`](https://github.com/distcc/distcc)、[`icecc`](https://github.com/icecc/icecream)等工具类似；
 
-- 我们的客户端伪装成编译器（通常是通过`ln -sf yadcc g++`创建的符号链接）;
-- 通过将我们的客户端伪装的编译器加入`PATH`头部，这样构建系统就会实际执行`yadcc`来编译;
-- `yadcc`会按照命令行对源代码进行预处理，得到一个自包含的的预处理结果，并将之分发至编译集群编译;
-- 等待直到从编译集群中得到编译结果。
+- 我们的客户端伪装成编译器（通常是通过`ln -sf yadcc g++`创建的符号链接）
+- 通过将我们的客户端伪装的编译器加入`PATH`头部，这样构建系统就会实际执行`yadcc`来编译
+- `yadcc`会按照命令行对源代码进行预处理，得到一个自包含的的预处理结果
+- 以预处理结果、编译器签名、命令行参数等为哈希，查询缓存，如果命中，直接返回结果
+- 如果不命中，就请求调度器获取一个编译节点，分发过去做编译
+- 等待直到从编译集群中得到编译结果，并更新缓存
 
 由于预处理时间通常远小于编译时间，因此这样可以降低单个文件的本地开销。同时，由于等待编译结果时本地无需进行操作，因此可以增大本地的编译并发度（如8核机器通常可以`make -j100`），以此实现更高的吞吐。
 
@@ -45,7 +47,7 @@
 
 ## 开始使用
 
-`yadcc`自带了必要的第三方库，因此通常不需要额外安装依赖。
+`Yadcc`自带了必要的第三方库，因此通常不需要额外安装依赖。
 
 需要注意的是，`yadcc`通过[git-submodule](https://linux.die.net/man/1/git-submodule)引用[`flare`](https://github.com/Tencent/flare)，因此编译之前需要执行`git submodule update`拉取`flare`。另外由于flare代码仓库需要git-lfs支持，因此您还需要安装git-lfs。具体可以参考[`flare`的相关说明](https://github.com/Tencent/flare)：
 
@@ -72,7 +74,7 @@ git submodule update .
 
 ### 搭建环境及使用
 
-搭建环境及使用方式可以参考[我们的文档](yadcc/doc/README.md)。
+搭建环境及使用方式可以参考[详细文档](yadcc/doc/README.md)。
 
 ## 效果
 
@@ -84,12 +86,12 @@ LLVM 项目：
 - 机型：8C16G。
 - 编译器：GCC8.2.0。
 
-在我们的测试环境中共计6124个编译目标，结果如下：
+在我们的测试环境中共计 6124 个编译目标，结果如下：
 
 - 本地8并发编译：47分51秒
 - 分布式256并发：3分11秒
 
-对于我们内部的一组实际产品项目代码上：
+对于我们内部的一组更大的实际产品项目代码上：
 
 - 16C 开发机本地 8 并发：2时18分17秒
 - ccache+distcc, -j144：44分23秒
@@ -99,3 +101,21 @@ LLVM 项目：
 详情参见[性能测试对比](yadcc/doc/benchmark.md)。
 
 总体而言，`yadcc`应当有相当明显的性能优势。
+
+## 相关项目
+
+对于大型 C++ 项目，构建速度一直是个比较的问题，因此目前也已经有了一些相关的项目：
+
+- https://ccache.dev/ 本地编译缓存
+- https://github.com/distcc/distcc 远程编译，支持搭配 ccache 本地缓存
+- https://github.com/icecc/icecream SUSE 开发的远程编译系统，fork 的 distcc，增加了调度器
+- https://github.com/mozilla/sccache Mizilla 开发的分布式共享编译缓存
+- https://github.com/alibaba/xcache Alibaba 开发的分布式共享编译缓存
+- https://docs.bazel.build/versions/master/remote-caching.html Google Bazel 远程缓存协议，有多个实现，只支持 Bazel 或支持该协议的构建系统
+- https://bazel.build/remote-execution-services.html Google Bazel 远程执行协议，有多个实现，只支持 Bazel 或支持该协议的构建系统
+
+比较而言，Bazel 相关的两个协议是非跨构建系统的；distcc 缺乏统一的调度，其他几个只是编译缓存；icecream 是和 yadcc 最接近的，也是我们一开始试用的目标，不过在并行数百个任务时，表现未达到预期。
+
+我们才开发了 yadcc，在增强性能和可靠性的同时，还额外增加了其他的一些功能。
+
+因此，yadcc 是我们目前已知的内置缓存机制的多语言通用分布式编译系统。

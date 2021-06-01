@@ -4,9 +4,6 @@
 /build32_release/
 /build64_debug/
 /build64_release/
-/build.ninja
-/.Building.lock
-/.blade.test.stamp
 /BLADE_ROOT.local
 
 # Vim
