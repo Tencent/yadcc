@@ -81,9 +81,9 @@ git submodule update .
 
 LLVM 项目：
 
-- 源代码：llvm-project-11.0.0.tar.xz。
+- 源代码：[llvm-project-11.0.0.tar.xz](https://prereleases.llvm.org/11.0.0/)。
 - 机型：8C16G。
-- 编译器：GCC8.2.0。
+- 编译器：GCC 8.2.0。
 
 在我们的测试环境中共计 6124 个编译目标，结果如下：
 
@@ -108,7 +108,7 @@ LLVM 项目：
 - https://ccache.dev/ 本地编译缓存
 - https://github.com/distcc/distcc 远程编译，支持搭配 ccache 本地缓存
 - https://github.com/icecc/icecream SUSE 开发的远程编译系统，fork 的 distcc，增加了调度器
-- https://github.com/mozilla/sccache Mizilla 开发的分布式共享编译缓存
+- https://github.com/mozilla/sccache Mozilla 开发的分布式共享编译缓存
 - https://github.com/alibaba/xcache Alibaba 开发的分布式共享编译缓存
 - https://docs.bazel.build/versions/master/remote-caching.html Google Bazel 远程缓存协议，有多个实现，只支持 Bazel 或支持该协议的构建系统
 - https://bazel.build/remote-execution-services.html Google Bazel 远程执行协议，有多个实现，只支持 Bazel 或支持该协议的构建系统
