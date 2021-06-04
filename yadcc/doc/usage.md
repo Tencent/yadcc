@@ -96,7 +96,9 @@ CXX='/path/to/yadcc g++' CC='/path/to/yadcc gcc' LD='/path/to/yadcc g++' ./blade
 
 ### Bazel
 
-*`bazel`默认会限制并发度到其估计的机器性能上限，实际使用需要通过`--local_cpu_resources=9999999 --local_ram_resources=999999`等参数绕过这一限制。*
+Bazel 需要通过 [--jobs](https://docs.bazel.build/versions/master/user-manual.html#flag--jobs) 参数指定任务数，比如 `--jobs=100`。
+
+*`bazel`默认会限制并发度到其估计的机器性能上限，实际使用还需要通过`--local_cpu_resources=9999999 --local_ram_resources=999999`等参数绕过这一限制。*
 
 我们**已知（部分版本的）`bazel`在并发度过高下，`bazel`自身性能存在瓶颈**（如我们内部常用的`-j512`。事实上，根据我们观察，160并发`bazel`已经不能很好的支撑）。
 
