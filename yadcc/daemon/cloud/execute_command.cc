@@ -54,7 +54,8 @@ pid_t StartProgram(const std::string& cmdline, int nice_level, int stdin_fd,
     }
 
     if (nice_level) {
-      nice(nice_level);
+      FLARE_PCHECK(nice(nice_level) != -1, "Failed to apply nice value [{}].",
+                   nice_level);
     }
     if (in_group) {
       setpgid(0, 0);
