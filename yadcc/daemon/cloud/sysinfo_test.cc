@@ -49,10 +49,12 @@ TEST(Sysinfo, All) {
 }
 
 TEST(Sysinfo, Loadavg) {
+  static const auto kThreads = std::min<int>(5, GetNumberOfProcessors());
+
   std::atomic<bool> shutdown = false;
   InitializeSystemInfo();
   std::vector<std::thread> threads;
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&] {
       while (!shutdown) {
       }
