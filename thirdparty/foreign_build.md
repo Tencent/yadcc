@@ -1,1 +1,1 @@
-../build/external/flare/thirdparty/foreign_build.md
+../external/flare/thirdparty/foreign_build.md
