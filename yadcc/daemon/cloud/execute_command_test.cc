@@ -34,7 +34,7 @@ TEST(ExecuteCommand, All) {
     SetNonblocking(e[1]);
   }
 
-  auto pid = StartProgram("/bin/cat", 0, input[0], output[1], error[1], false);
+  auto pid = StartProgram("/bin/cat", 5, input[0], output[1], error[1], false);
 
   ASSERT_EQ(4, WriteTo(input[1], flare::CreateBufferSlow("1234")));
   ASSERT_EQ(4, WriteTo(input[1], flare::CreateBufferSlow("5678")));
