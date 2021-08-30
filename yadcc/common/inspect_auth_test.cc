@@ -16,8 +16,8 @@
 
 #include <string>
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gflags/gflags.h"
+#include "gtest/gtest.h"
 
 #include "flare/base/encoding.h"
 #include "flare/base/string.h"

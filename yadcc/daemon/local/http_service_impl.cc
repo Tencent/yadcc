@@ -17,23 +17,35 @@
 #include <signal.h>
 #include <sys/types.h>
 
+#include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/jsoncpp/json.h"
+#include "gflags/gflags.h"
+#include "jsoncpp/json.h"
 
 #include "flare/base/buffer.h"
 #include "flare/base/encoding.h"
+#include "flare/base/expected.h"
 #include "flare/base/function.h"
 #include "flare/net/http/http_request.h"
 #include "flare/net/http/http_response.h"
 #include "flare/rpc/rpc_channel.h"
 #include "flare/rpc/rpc_client_controller.h"
 
+#include "yadcc/api/daemon.flare.pb.h"
 #include "yadcc/daemon/cache_format.h"
 #include "yadcc/daemon/common_flags.h"
+#include "yadcc/daemon/local/distributed_task/cxx_compilation_task.h"
 #include "yadcc/daemon/local/distributed_task_dispatcher.h"
+#include "yadcc/daemon/local/file_digest_cache.h"
 #include "yadcc/daemon/local/local_task_monitor.h"
+#include "yadcc/daemon/local/messages.pb.h"
+#include "yadcc/daemon/local/packing.h"
 
 using namespace std::literals;
 
@@ -49,9 +61,7 @@ extern const char kBuildTime[];
 
 namespace yadcc::daemon::local {
 
-HttpServiceImpl::HttpServiceImpl()
-    : compiler_exposer_("yadcc/compilers", [this] { return DumpCompilers(); }) {
-}
+HttpServiceImpl::HttpServiceImpl() {}
 
 // This is rather ugly. TODO(luobogao): Let's see if we can provide the same
 // functionality in Flare.
@@ -79,10 +89,14 @@ void HttpServiceImpl::OnPost(const flare::HttpRequest& request,
   static const std::unordered_map<std::string, Handler> kHandlers = {
       {"/local/acquire_quota", &HttpServiceImpl::AcquireQuota},
       {"/local/release_quota", &HttpServiceImpl::ReleaseQuota},
-      {"/local/submit_task", &HttpServiceImpl::SubmitTask},
-      {"/local/wait_for_task", &HttpServiceImpl::WaitForTask},
+      {"/local/set_file_digest", &HttpServiceImpl::SetFileDigest},
+      {"/local/submit_cxx_task", &HttpServiceImpl::SubmitCxxTask},
+      {"/local/wait_for_cxx_task",
+       &HttpServiceImpl::WaitForTaskGeneric<WaitForCxxTaskRequest,
+                                            CxxCompilationTask>},
       {"/local/ask_to_leave", &HttpServiceImpl::AskToLeave}};
 
+  FLARE_VLOG(1, "Calling [{}].", request.uri());
   if (auto iter = kHandlers.find(request.uri()); iter != kHandlers.end()) {
     return (this->*(iter->second))(request, response, context);
   }
@@ -143,122 +157,88 @@ void HttpServiceImpl::ReleaseQuota(const flare::HttpRequest& request,
       jsv["requestor_pid"].asUInt());
 }
 
-void HttpServiceImpl::SubmitTask(const flare::HttpRequest& request,
-                                 flare::HttpResponse* response,
-                                 flare::HttpServerContext* context) {
-  // Requestor.
-  auto requestor_pid =
-      request.headers()->TryGet<int>("X-Requestor-Process-Id").value_or(-1);
-  // Source information.
-  std::string source_path{
-      // FIXME: Do we need to pct-encode the path?
-      request.headers()->TryGet("X-Source-Path").value_or("")};
-  std::string source_digest{
-      request.headers()->TryGet("X-Source-Digest").value_or("")};
-  // Controls how the compilation should be performed.
-  std::string invocation_args{request.headers()
-                                  ->TryGet("X-Compiler-Invocation-Arguments")
-                                  .value_or("")};
-  auto cache_control =
-      request.headers()->TryGet<int>("X-Cache-Control").value_or(1);
-
-  // Arguments validation.
-  if (requestor_pid <= 1 || source_path.empty() || invocation_args.empty() ||
-      (cache_control < 0 || cache_control > 2) ||
-      (cache_control != 0 && source_digest.empty()) ||
-      request.headers()->TryGet("Content-Encoding") != "application/zstd") {
+void HttpServiceImpl::SetFileDigest(const flare::HttpRequest& request,
+                                    flare::HttpResponse* response,
+                                    flare::HttpServerContext* context) {
+  auto req = TryParseJsonAsMessage<SetFileDigestRequest>(*request.body());
+  if (!req) {
     response->set_status(flare::HttpStatus::BadRequest);
-    response->set_body("Invalid arguments.");
+    response->set_body(
+        flare::Format("Failed to parse request: {}", req.error().ToString()));
     return;
   }
-  auto compiler_digest = TryGetOrSaveCompilerDigestByRequest(request);
-  if (!compiler_digest) {
-    response->set_status(flare::HttpStatus::BadRequest);
-    response->set_body("Invalid arguments.");
-    return;
-  }
-
-  // TODO(luobogao): If there's no process whose PID is `requestor_pid`, bail
-  // out.
-
-  // Queue this task to the dispatcher.
-  CompilationTask task;
-  task.requestor_pid = requestor_pid;
-  task.env_desc.set_compiler_digest(*compiler_digest);
-  task.source_digest = source_digest;
-  task.cache_control = static_cast<CacheControl>(cache_control);
-  task.source_path = source_path;
-  task.invocation_arguments = invocation_args;
-  task.preprocessed_source = std::move(*request.noncontiguous_body());
-
-  // If the task can't be dispatched after 5min, bail out.
-  auto task_id = DistributedTaskDispatcher::Instance()->QueueTask(
-      std::move(task), flare::ReadCoarseSteadyClock() + 5min);
-  // Fill the response.
-  response->set_body(fmt::format("{{\"task_id\":\"{}\"}}", task_id));
+  FileDigestCache::Instance()->Set(req->file_desc().path(),
+                                   req->file_desc().size(),
+                                   req->file_desc().timestamp(), req->digest());
 }
 
-void HttpServiceImpl::WaitForTask(const flare::HttpRequest& request,
-                                  flare::HttpResponse* response,
-                                  flare::HttpServerContext* context) {
-  Json::Value req_jsv;
-  if (!Json::Reader().parse(*request.body(), req_jsv) || !req_jsv.isObject() ||
-      !req_jsv["milliseconds_to_wait"].isUInt() ||
-      !req_jsv["task_id"].isString()) {
-    response->set_status(flare::HttpStatus::BadRequest);
-    response->set_body("Invalid arguments.");
-    return;
-  }
-  auto task_id = flare::TryParse<std::uint64_t>(req_jsv["task_id"].asString());
-  if (!task_id) {
-    response->set_status(flare::HttpStatus::BadRequest);
-    response->set_body("Invalid arguments.");
+void HttpServiceImpl::SubmitCxxTask(const flare::HttpRequest& request,
+                                    flare::HttpResponse* response,
+                                    flare::HttpServerContext* context) {
+  auto parsed_opt = TryParseMultiChunkRequest<SubmitCxxTaskRequest>(
+      *request.noncontiguous_body());
+  if (!parsed_opt) {
+    response->set_status(
+        static_cast<flare::HttpStatus>(parsed_opt.error().code()));
+    response->set_body(parsed_opt.error().message());
     return;
   }
 
+  auto task = std::make_unique<CxxCompilationTask>();
+  if (auto status = task->Prepare(parsed_opt->first, parsed_opt->second);
+      !status.ok()) {
+    response->set_status(static_cast<flare::HttpStatus>(status.code()));
+    response->set_body(status.message());
+    return;
+  }
+
+  SubmitCxxTaskResponse resp_msg;
+  resp_msg.set_task_id(DistributedTaskDispatcher::Instance()->QueueTask(
+      std::move(task), flare::ReadCoarseSteadyClock() + 5min));
+  response->set_body(WriteMessageAsJson(resp_msg));
+}
+
+template <class Request, class Task>
+void HttpServiceImpl::WaitForTaskGeneric(const flare::HttpRequest& request,
+                                         flare::HttpResponse* response,
+                                         flare::HttpServerContext* context) {
   constexpr auto kMaximumWaitableTime = 10s;
-  auto desired_wait = req_jsv["milliseconds_to_wait"].asUInt() * 1ms;
 
-  // Sanity checks.
-  if (desired_wait > kMaximumWaitableTime) {
+  auto req_msg = TryParseJsonAsMessage<Request>(*request.body());
+  if (!req_msg) {
+    response->set_status(flare::HttpStatus::BadRequest);
+    response->set_body(flare::Format("Failed to parse request: {}",
+                                     req_msg.error().ToString()));
+    return;
+  }
+  if (req_msg->milliseconds_to_wait() * 1ms > kMaximumWaitableTime) {
     response->set_status(flare::HttpStatus::BadRequest);
     response->set_body("Unacceptable `milliseconds_to_wait`.");
     return;
   }
 
-  CompilationOutput output;
-  auto status = DistributedTaskDispatcher::Instance()->WaitForTask(
-      *task_id, desired_wait, &output);
-  if (status == DistributedTaskDispatcher::WaitStatus::Timeout) {
-    response->set_status(flare::HttpStatus::ServiceUnavailable);
-    return;
-  } else if (status == DistributedTaskDispatcher::WaitStatus::NotFound) {
-    FLARE_LOG_WARNING_EVERY_SECOND(
-        "Received a request for a non-existing task ID [{}].", *task_id);
-    response->set_status(flare::HttpStatus::NotFound);
-    return;
+  auto wait_result = DistributedTaskDispatcher::Instance()->WaitForTask<Task>(
+      req_msg->task_id(), req_msg->milliseconds_to_wait() * 1ms);
+  if (!wait_result) {
+    if (wait_result.error() == DistributedTaskDispatcher::WaitStatus::Timeout) {
+      response->set_status(flare::HttpStatus::ServiceUnavailable);
+      return;
+    } else if (wait_result.error() ==
+               DistributedTaskDispatcher::WaitStatus::NotFound) {
+      FLARE_LOG_WARNING_EVERY_SECOND(
+          "Received a request for a non-existing task ID [{}].",
+          req_msg->task_id());
+      response->set_status(flare::HttpStatus::NotFound);
+      return;
+    }
   }
 
-  // Fill the response.
-  //
-  // The format of the response is a bit messy. I can't come up with a better
-  // format for the moment. (No, simply storing `stdout` / `stderr` in HTTP
-  // header won't work, as `stderr` can be rather large.)
-  //
-  // Perhaps we should implement something like `WriteDelimited` for
-  // `NoncontiguousBuffer` in Flare? That would allow us to efficiently
-  // concatenate multiple buffers together.
-  flare::NoncontiguousBufferBuilder resp_builder;
-  Json::Value jsv;
-  jsv["exit_code"] = output.exit_code;
-  jsv["output"] = output.standard_output;
-  jsv["error"] = output.standard_error;
-  auto first_part = Json::FastWriter().write(jsv);
-  resp_builder.Append(fmt::format("{:x}\r\n{}\r\n{:x}\r\n", first_part.size(),
-                                  first_part, output.object_file.ByteSize()));
-  resp_builder.Append(output.object_file);
-  resp_builder.Append("\r\n");
-  response->set_body(resp_builder.DestructiveGet());
+  if (auto output = wait_result->get()->GetOutput()) {
+    response->set_body(WriteMultiChunkResponse(output->first, output->second));
+  } else {
+    response->set_status(static_cast<flare::HttpStatus>(output.error().code()));
+    response->set_body(output.error().message());
+  }
 }
 
 void HttpServiceImpl::AskToLeave(const flare::HttpRequest& request,
@@ -266,71 +246,6 @@ void HttpServiceImpl::AskToLeave(const flare::HttpRequest& request,
                                  flare::HttpServerContext* context) {
   FLARE_LOG_INFO("Someone asked us to leave. Killing ourselves.");
   kill(getpid(), SIGINT);
-}
-
-std::optional<std::string> HttpServiceImpl::TryGetOrSaveCompilerDigestByRequest(
-    const flare::HttpRequest& request) {
-  auto path = request.headers()->TryGet("X-Compiler-Path");
-  auto mtime =
-      request.headers()->TryGet<std::uint64_t>("X-Compiler-Modification-Time");
-  auto size = request.headers()->TryGet<std::uint64_t>("X-Compiler-Size");
-
-  // For backward compatibility, we check `X-Compiler-Digest` first.
-  auto compiler_digest = request.headers()->TryGet("X-Compiler-Digest");
-  if (compiler_digest && compiler_digest->empty()) {
-    return std::nullopt;  // Invalid argument, to be precise.
-  }
-
-  // The old protocol.
-  if (!path || !mtime || !size) {
-    // Compiler digest must be provided by the client if the old protocol is
-    // used.
-    if (!compiler_digest) {
-      return std::nullopt;
-    }
-    return std::string(*compiler_digest);
-  }
-
-  // Newer protocol then.
-  if (path->empty() || path->front() != '/' /* Absolute path is required. */ ||
-      !*mtime || !*size) {
-    return std::nullopt;  // Invalid argument, to be precise.
-  }
-
-  std::tuple personality(std::string(*path), *mtime, *size);
-  if (compiler_digest) {
-    // If the caller is kind enough to provide us with the compiler's digest, we
-    // cache it.
-    //
-    // This allows the client not to calculate the digest (which can be costly)
-    // of compiler each time a file is compiled. Instead, the client can provide
-    // only `lstat` info of the compiler in the subsequent compilation requests.
-    std::scoped_lock _(compiler_digests_lock_);
-    compiler_digests_[personality] = *compiler_digest;
-    return std::string(*compiler_digest);
-  } else {
-    // The client provides only the basic information of the compiler, but not
-    // the digest. Let's see if the digest is known to us.
-    std::shared_lock _(compiler_digests_lock_);
-    if (auto iter = compiler_digests_.find(personality);
-        iter != compiler_digests_.end()) {
-      return iter->second;
-    }
-    return std::nullopt;  // Unrecognized compiler.
-  }
-}
-
-Json::Value HttpServiceImpl::DumpCompilers() {
-  Json::Value jsv;
-  std::shared_lock _(compiler_digests_lock_);
-  for (auto&& [k, v] : compiler_digests_) {
-    auto&& [path, mtime, size] = k;
-    auto&& entry = jsv[path];
-    entry["mtime"] = static_cast<Json::UInt64>(mtime);
-    entry["size"] = static_cast<Json::UInt64>(size);
-    entry["digest"] = v;
-  }
-  return jsv;
 }
 
 }  // namespace yadcc::daemon::local

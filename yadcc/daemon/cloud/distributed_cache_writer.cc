@@ -19,7 +19,6 @@
 #include "flare/base/never_destroyed.h"
 #include "flare/rpc/rpc_client_controller.h"
 
-#include "yadcc/daemon/cache_format.h"
 #include "yadcc/daemon/common_flags.h"
 
 using namespace std::literals;
@@ -43,15 +42,13 @@ DistributedCacheWriter::~DistributedCacheWriter() {
 }
 
 flare::Future<bool> DistributedCacheWriter::AsyncWrite(
-    const std::string& key, int exit_code, const std::string& standard_output,
-    const std::string& standard_error,
-    const flare::NoncontiguousBuffer& buffer) {
+    const std::string& key, const CacheEntry& cache_entry) {
   if (!cache_stub_) {
     // Caching is not enabled at all.
     return true;
   }
 
-  if (exit_code != 0) {
+  if (cache_entry.exit_code != 0) {
     // For the moment we don't cache failed compilation result.
     //
     // Note that, if our system is robust enough (this may require us to only
@@ -71,8 +68,7 @@ flare::Future<bool> DistributedCacheWriter::AsyncWrite(
   ctx->req.set_token(FLAGS_token);
   ctx->req.set_key(key);
   ctx->ctlr.SetTimeout(5s);
-  ctx->ctlr.SetRequestAttachment(WriteCacheEntry(
-      CacheEntry{exit_code, standard_output, standard_error, buffer}));
+  ctx->ctlr.SetRequestAttachment(WriteCacheEntry(cache_entry));
   return cache_stub_->PutEntry(ctx->req, &ctx->ctlr)
       .Then([ctx, key](auto result) {
         if (!result) {

@@ -16,7 +16,7 @@
 
 #include <chrono>
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 #include "flare/fiber/execution_context.h"
 #include "flare/init/override_flag.h"
@@ -24,16 +24,19 @@
 #include "flare/testing/main.h"
 #include "flare/testing/rpc_controller.h"
 
-#include "yadcc/api/cache.flare.pb.h"
+#include "yadcc/api/cache.pb.h"
 
 using namespace std::literals;
 
-FLARE_OVERRIDE_FLAG(acceptable_tokens, "token1,token2");
+DECLARE_string(acceptable_user_tokens);
+DECLARE_string(acceptable_servant_tokens);
 
 namespace yadcc::cache {
 
 TEST(CacheServiceImpl, Token) {
   flare::fiber::ExecutionContext::Create()->Execute([&] {
+    FLAGS_acceptable_user_tokens = "token1,token2";
+    FLAGS_acceptable_servant_tokens = "token2,token3";
     CacheServiceImpl impl;
     flare::RpcServerController ctlr;
 
@@ -47,72 +50,87 @@ TEST(CacheServiceImpl, Token) {
       EXPECT_EQ(STATUS_ACCESS_DENIED, ctlr.ErrorCode());
 
       ctlr.Reset();
-      req.set_token("wrong token");
+      req.set_token("token3");
       impl.TryGetEntry(req, &resp, &ctlr);
       EXPECT_EQ(STATUS_ACCESS_DENIED, ctlr.ErrorCode());
 
-      for (auto&& e : {"token1", "token2"}) {
-        ctlr.Reset();
-        req.set_token(e);
-        impl.TryGetEntry(req, &resp, &ctlr);
-        EXPECT_EQ(STATUS_NOT_FOUND, ctlr.ErrorCode());  // RPC performed.
-      }
+      ctlr.Reset();
+      req.set_token("token1");
+      impl.TryGetEntry(req, &resp, &ctlr);
+      EXPECT_EQ(STATUS_NOT_FOUND, ctlr.ErrorCode());  // RPC performed.
     }
+
     {
       PutEntryRequest req;
       PutEntryResponse resp;
+      req.set_key("my key");
+
       ctlr.Reset();
+      req.set_token("token1");
       impl.PutEntry(req, &resp, &ctlr);
       EXPECT_EQ(STATUS_ACCESS_DENIED, ctlr.ErrorCode());
+
+      for (auto&& e : {"token2", "token3"}) {
+        ctlr.Reset();
+        req.set_token(e);
+        impl.PutEntry(req, &resp, &ctlr);
+        ASSERT_FALSE(ctlr.Failed());
+      }
     }
 
     {
       TryGetEntryRequest req;
       TryGetEntryResponse resp;
       req.set_key("my key");
+      req.set_token("token2");
       ctlr.Reset();
-      impl.TryGetEntry(req, &resp, &ctlr);
-      EXPECT_EQ(STATUS_ACCESS_DENIED, ctlr.ErrorCode());
+      ASSERT_FALSE(ctlr.Failed());
     }
   });
 }
 
 TEST(CacheServiceImpl, Ops) {
   flare::fiber::ExecutionContext::Create()->Execute([&] {
+    FLAGS_acceptable_user_tokens = "token1";
+    FLAGS_acceptable_servant_tokens = "token2";
     CacheServiceImpl impl;
 
     {
       TryGetEntryRequest req;
-      req.set_key("my key");
-      req.set_token("token1");
-      flare::RpcServerController ctlr;
       TryGetEntryResponse resp;
-      impl.TryGetEntry(req, &resp, &ctlr);
+      flare::RpcServerController ctlr;
+      req.set_key("my key2");
 
+      req.set_token("token1");
+      impl.TryGetEntry(req, &resp, &ctlr);
       EXPECT_EQ(STATUS_NOT_FOUND, ctlr.ErrorCode());
+
+      req.set_token("token2");
+      impl.TryGetEntry(req, &resp, &ctlr);
+      EXPECT_EQ(STATUS_ACCESS_DENIED, ctlr.ErrorCode());
     }
 
     {
       PutEntryRequest req;
-      req.set_key("my key");
-      req.set_token("token1");
+      PutEntryResponse resp;
       flare::RpcServerController ctlr;
+      req.set_key("my key2");
       flare::testing::SetRpcServerRequestAttachment(
           &ctlr, flare::CreateBufferSlow("body"));
-      PutEntryResponse resp;
-      impl.PutEntry(req, &resp, &ctlr);
 
+      req.set_token("token2");
+      impl.PutEntry(req, &resp, &ctlr);
       ASSERT_FALSE(ctlr.Failed());
     }
 
     {
       TryGetEntryRequest req;
-      req.set_key("my key");
-      req.set_token("token1");
-      flare::RpcServerController ctlr;
       TryGetEntryResponse resp;
-      impl.TryGetEntry(req, &resp, &ctlr);
+      flare::RpcServerController ctlr;
+      req.set_key("my key2");
 
+      req.set_token("token1");
+      impl.TryGetEntry(req, &resp, &ctlr);
       EXPECT_EQ("body", flare::FlattenSlow(ctlr.GetResponseAttachment()));
     }
   });

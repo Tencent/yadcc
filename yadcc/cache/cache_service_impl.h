@@ -60,12 +60,17 @@ class CacheServiceImpl : public SyncCacheService {
   Json::Value DumpInternals();
 
  private:
-  std::unique_ptr<TokenVerifier> token_verifier_ = MakeTokenVerifierFromFlag();
+  std::unique_ptr<TokenVerifier> is_user_verifier_;
+  std::unique_ptr<TokenVerifier> is_servant_verifier_;
 
-  std::unique_ptr<CacheEngine> cache_;
   std::uint64_t cache_purge_timer_;
 
+  // L1 & L2.
+  std::unique_ptr<CacheEngine> cache_;
   std::unique_ptr<InMemoryCache> in_memory_cache_;
+
+  // Statistics.
+  std::atomic<std::uint64_t> cache_hits_{}, cache_miss_{};
 
   std::mutex bf_lock_;
   BloomFilterGenerator bf_gen_;

@@ -14,7 +14,7 @@
 
 #include "yadcc/cache/in_memory_cache.h"
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 #include "flare/base/buffer.h"
 #include "flare/base/random.h"

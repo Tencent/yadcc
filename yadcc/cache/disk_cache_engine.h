@@ -15,24 +15,14 @@
 #ifndef YADCC_CACHE_DISK_CACHE_ENGINE_H_
 #define YADCC_CACHE_DISK_CACHE_ENGINE_H_
 
-#include <atomic>
-#include <chrono>
-#include <map>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <string>
-#include <tuple>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "flare/base/buffer.h"
-#include "flare/base/exposed_var.h"
-#include "flare/base/handle.h"
 
 #include "yadcc/cache/cache_engine.h"
-#include "yadcc/cache/consistent_hash.h"
+#include "yadcc/common/disk_cache.h"
 
 namespace yadcc::cache {
 
@@ -66,73 +56,13 @@ class DiskCacheEngine : public CacheEngine {
   // to make space.
   //
   // It's slow, and may block `TryGet` / `Put`, so don't call it too often.
-  std::vector<std::string> Purge() override;
+  void Purge() override;
 
   // Dumps internals about the cache.
   Json::Value DumpInternals() const override;
 
  private:
-  void InitializeWorkspaceAt(const std::string& path);
-
-  // To transform to the weight of directories according to the each size.
-  std::map<std::string, std::uint64_t> GetWeightedDirs(
-      const std::vector<std::pair<std::string, std::uint64_t>>& directories);
-
-  // Determine which file contains value of the given key.
-  std::optional<std::string> TryGetPathOfKey(const std::string& key,
-                                             bool record = false) const;
-
-  // Purge a cache directory.
-  std::vector<std::string> PurgeCacheAt(const std::string& path,
-                                        std::uint64_t size_limit);
-
-  // Return value describes each file key in the specified dir. We also want the
-  // file size of each key, so the second field of pair describe it.
-  std::unordered_map<std::string,
-                     std::vector<std::pair<std::string, std::size_t>>>
-  GetEntryKeysSnapshot() const;
-
-  // Help us figure out how much keys and how many byte-size used per dir.
-  std::unordered_map<std::string, std::pair<std::size_t, std::size_t>>
-  GetKeyAndByteSizePerDir() const;
-
-  // Create a new entry. Returns: [handle, dir_lock, cache_entry_lock].
-  std::tuple<flare::Handle, std::unique_lock<std::shared_mutex>,
-             std::unique_lock<std::shared_mutex>>
-  CreateEntryLocked(const std::string& key, const std::string& path);
-
- private:
-  struct EntryDesc {
-    std::shared_mutex entry_lock;
-    std::size_t file_size;
-    std::atomic<std::chrono::nanoseconds> last_accessed;
-  };
-
-  struct EntriesInDir {
-    std::shared_mutex dir_lock;
-
-    // Make sure you hold shared ownership on `dir_lock` during access to
-    // entries. Holding `EntryDesc.entry_lock` only is NOT safe.
-    std::unordered_map<std::string, std::unique_ptr<EntryDesc>> entries;
-  };
-
-  std::vector<std::pair<std::string, std::uint64_t>> dirs_;
-
-  // Maps user's key to `options_.shards`.
-  ConsistentHash shard_mapper_;
-
-  // The structure (keys) of this map is initialized on start up, only its
-  // values are touched, therefore no locking is required here.
-  std::unordered_map<std::string, std::unique_ptr<EntriesInDir>>
-      entries_per_dir_;
-
-  // We never insert new keys into `shard_hits_`, only its value is mutated.
-  // Therefore no locking is required.
-  std::unordered_map<std::string, std::unique_ptr<std::atomic<std::size_t>>>
-      shard_hits_;
-  mutable std::atomic<std::size_t> cache_fills_{}, cache_hits_{},
-      cache_misses_{};
-  mutable std::atomic<std::size_t> cache_overwrites_{};
+  DiskCache disk_cache_impl_;
 };
 
 }  // namespace yadcc::cache

@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "thirdparty/jsoncpp/value.h"
+#include "jsoncpp/value.h"
 
 #include "flare/base/buffer.h"
 #include "flare/base/dependency_registry.h"
@@ -44,7 +44,7 @@ class CacheEngine {
                    const flare::NoncontiguousBuffer& bytes) = 0;
 
   // Purge function. Return the keys purged.
-  virtual std::vector<std::string> Purge() = 0;
+  virtual void Purge() = 0;
 
   // Dumps internal about this cache engine.
   virtual Json::Value DumpInternals() const = 0;

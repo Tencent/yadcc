@@ -14,7 +14,7 @@
 
 #include <optional>
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 #include "yadcc/common/parse_size.h"
 

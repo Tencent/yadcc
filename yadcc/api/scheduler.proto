@@ -30,7 +30,8 @@ enum Status {
   STATUS_NOT_IMPLEMENTED = 1002;
   STATUS_ACCESS_DENIED = 1003;  // Invalid token?
   STATUS_INVALID_ARGUMENT = 1004;
-  STATUS_VERSION_TOO_OLD = 1005;  // Daemon should be upgraded.
+  STATUS_VERSION_TOO_OLD = 1005;            // Daemon should be upgraded.
+  STATUS_ENVIRONMENT_NOT_AVAILABLE = 1006;  // No matched servant environment.
 }
 
 // Defines priority when selecting servant. The scheduler usually prefer to
@@ -49,10 +50,15 @@ enum ServantPriority {
 // @sa: Enumeration with the same name in `daemon/cloud/execution_engine.h`.
 enum NotAcceptingTaskReason {
   NOT_ACCEPTING_TASK_REASON_UNKNOWN = 0;
+
+  // Keep them in sync with `daemon/cloud/execution_engine.h`.
   NOT_ACCEPTING_TASK_REASON_USER_INSTRUCTED = 1;
   NOT_ACCEPTING_TASK_REASON_POOR_MACHINE = 2;
   NOT_ACCEPTING_TASK_REASON_CGROUPS_PRESENT = 3;
   NOT_ACCEPTING_TASK_REASON_BEHIND_NAT = 4;
+
+  // Solely used by this IDL.
+  NOT_ACCEPTING_TASK_REASON_NOT_VERIFIED = 100;
 }
 
 message HeartbeatRequest {
@@ -85,7 +91,7 @@ message HeartbeatRequest {
   ServantPriority servant_priority = 14;
 
   // The reason why `capacity` is zero.
-  NotAcceptingTaskReason not_accepting_task_reason = 12;
+  uint32 not_accepting_task_reason = 12;  // @sa: NotAcceptingTaskReason
 
   // Maximum number of task concurrency this node is willing to provide.
   uint32 capacity = 3;
@@ -103,12 +109,13 @@ message HeartbeatRequest {
   // State of this servant.  //
   /////////////////////////////
 
-  // IDs of running tasks on this servant. This is the grant ID allocated by the
-  // scheduler, not some task ID allocated by daemon or the client itself.
-  repeated uint64 running_tasks = 5 [packed = true];
+  // The desc of running tasks on servant. This help scheduler to collect all
+  // running tasks of cluster, avoiding unnecessary compilations and cluster
+  // overload.
+  repeated RunningTask running_tasks = 17;
 
   //////////////////////////////////
-  // Date to report to scheduler. //
+  // Data to report to scheduler. //
   //////////////////////////////////
 }
 
@@ -188,6 +195,9 @@ message WaitForStartingTaskRequest {
 
   // The caller should call `KeepTaskAlive` in this time period.
   uint32 next_keep_alive_in_ms = 5;  // An interval less than 10s is suggested.
+
+  // Minimal version of daemon is requested.
+  uint32 min_version = 7;
 }
 
 message WaitForStartingTaskResponse {
@@ -221,29 +231,10 @@ message FreeTaskRequest {
 message FreeTaskResponse {}
 
 message RunningTask {
-  uint64 task_id = 1;
-  string servant_location = 2;
-  EnvironmentDesc env_desc = 3;
-  string invocation_arguments = 4;
-  string source_digest = 5;
-}
-
-message NotifyTaskStartRequest {
-  uint64 task_grant_id = 1;
-  RunningTask task = 2;
-}
-
-message NotifyTaskStartResponse {
-  // NOTHING.
-}
-
-message NotifyTaskStatusChangeRequest {
-  uint64 task_grant_id = 1;
-  uint32 status = 2;
-}
-
-message NotifyTaskStatusChangeResponse {
-  // NOTHING.
+  uint64 servant_task_id = 1;
+  uint64 task_grant_id = 2;
+  string servant_location = 3;
+  string task_digest = 7;
 }
 
 message GetRunningTasksRequest {
@@ -301,13 +292,6 @@ service SchedulerService {
   //
   // Well-behaved client should pair this call with its acquisition.
   rpc FreeTask(FreeTaskRequest) returns (FreeTaskResponse);
-
-  // Notify compile task started.
-  rpc NotifyTaskStart(NotifyTaskStartRequest) returns (NotifyTaskStartResponse);
-
-  // Notify compile task status changed.
-  rpc NotifyTaskStatusChange(NotifyTaskStatusChangeRequest)
-      returns (NotifyTaskStatusChangeResponse);
 
   // Get all running compile tasks.
   rpc GetRunningTasks(GetRunningTasksRequest) returns (GetRunningTasksResponse);

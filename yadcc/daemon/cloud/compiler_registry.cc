@@ -18,34 +18,53 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/crypto/blake3.h"
 #include "flare/base/encoding.h"
 #include "flare/base/logging.h"
 #include "flare/base/never_destroyed.h"
 #include "flare/base/string.h"
+#include "flare/fiber/timer.h"
 
+#include "yadcc/common/dir.h"
+
+using namespace std::literals;
+
+DEFINE_int32(compiler_rescan_interval, 60,
+             "Compiler rescan interval, in seconds");
 DEFINE_string(
     extra_compiler_dirs, "",
     "By default, yadcc recognizes compilers appears in PATH. To add compilers "
     "that does not appear in PATH, list them here. Paths should be separated "
     "by a colon (':'). e.g. `/usr/local/tools/gcc/bin`");
+DEFINE_string(
+    extra_compiler_bundle_dirs, "",
+    "If you have multiple compilers installed inside the same parent "
+    "directory, you may simply specify the parent directory here. We enumerate "
+    "every compiler in `<bundle_dir1>/*/bin`, `<bundle_dir2>/*/bin`, .... "
+    "Paths should be separated by a colon.");
 
 namespace yadcc::daemon::cloud {
 
 namespace {
 
-std::string GetFileDigest(const std::string_view& path) {
+std::optional<std::string> TryGetFileDigest(const std::string_view& path) {
   std::ifstream input(std::string(path), std::ios::binary);
-  FLARE_CHECK(input, "Failed to open [{}].", path);
+  if (!input) {
+    FLARE_LOG_ERROR("Failed to open [{}].", path);
+    return std::nullopt;
+  }
   return flare::EncodeHex(
       flare::Blake3(std::string(std::istreambuf_iterator<char>(input), {})));
 }
@@ -66,7 +85,6 @@ std::vector<std::string> TryLookupCompilerIn(const std::string_view& dir) {
 
   for (auto&& e : kCompilerExecutables) {
     auto path = PathJoin(dir, e);
-
     struct stat buf;
     if (lstat(path.c_str(), &buf) == 0) {  // File exists.
       if (S_ISLNK(buf.st_mode)) {          // Symbolic link, ignore it.
@@ -74,7 +92,7 @@ std::vector<std::string> TryLookupCompilerIn(const std::string_view& dir) {
       }
       if ((geteuid() == buf.st_uid && (buf.st_mode & S_IXUSR)) ||
           (buf.st_mode & S_IXOTH)) {  // Executable.
-        result.push_back(path);
+        result.push_back(GetCanonicalPath(path));
       }
     }
   }
@@ -85,6 +103,24 @@ std::vector<std::string_view> GetDirectoriesInPath() {
   return flare::Split(getenv("PATH"), ":");
 }
 
+// Register a compilation environment.
+void AddEnvironmentTo(const std::string_view& path,
+                      std::unordered_map<std::string, std::string>* temp_paths,
+                      std::vector<EnvironmentDesc>* temp_envs) {
+  EnvironmentDesc desc;
+  auto digest = TryGetFileDigest(path);
+  if (digest == std::nullopt) {
+    return;
+  }
+  desc.set_compiler_digest(*digest);
+
+  auto env_string = desc.compiler_digest();
+  if (temp_paths->count(env_string) == 0) {
+    (*temp_paths)[env_string] = path;
+    temp_envs->push_back(desc);
+  }  // Duplicates are ignored silently.
+}
+
 }  // namespace
 
 CompilerRegistry* CompilerRegistry::Instance() {
@@ -93,17 +129,66 @@ CompilerRegistry* CompilerRegistry::Instance() {
 }
 
 CompilerRegistry::CompilerRegistry() {
-  // User-supplied compilers.
-  for (auto&& dir : flare::Split(FLAGS_extra_compiler_dirs, ":")) {
-    for (auto&& e : TryLookupCompilerIn(dir)) {
-      RegisterEnvironment(e);
-    }
+  // Set up a timer to periodically recheck compilers present.
+  compiler_scanner_timer_ = flare::fiber::SetTimer(
+      FLAGS_compiler_rescan_interval * 1s, [this] { OnCompilerRescanTimer(); });
+  OnCompilerRescanTimer();
+}
+
+CompilerRegistry::~CompilerRegistry() {}
+
+std::vector<EnvironmentDesc> CompilerRegistry::EnumerateEnvironments() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return environments_;
+}
+
+std::optional<std::string> CompilerRegistry::TryGetCompilerPath(
+    const EnvironmentDesc& env) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto iter = compiler_paths_.find(env.compiler_digest());
+  if (iter != compiler_paths_.end()) {
+    return iter->second;
   }
+  return {};
+}
+
+void CompilerRegistry::Stop() {
+  flare::fiber::KillTimer(compiler_scanner_timer_);
+}
+
+void CompilerRegistry::Join() {}
+
+void CompilerRegistry::OnCompilerRescanTimer() {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  std::unordered_map<std::string, std::string> temp_paths;
+  std::vector<EnvironmentDesc> temp_envs;
 
   // Compilers in `PATH`.
   for (auto&& dir : GetDirectoriesInPath()) {
     for (auto&& e : TryLookupCompilerIn(dir)) {
-      RegisterEnvironment(e);
+      AddEnvironmentTo(e, &temp_paths, &temp_envs);
+    }
+  }
+
+  // User-supplied compilers.
+  for (auto&& dir : flare::Split(FLAGS_extra_compiler_dirs, ":")) {
+    for (auto&& e : TryLookupCompilerIn(dir)) {
+      AddEnvironmentTo(e, &temp_paths, &temp_envs);
+    }
+  }
+
+  // User-supplied compiler bundles..
+  for (auto&& dir : flare::Split(FLAGS_extra_compiler_bundle_dirs, ":")) {
+    struct stat buf;
+    if (lstat(flare::Format("{}", dir).c_str(), &buf) == 0 &&
+        S_ISDIR(buf.st_mode)) {
+      std::vector<DirEntry> subdirs = EnumerateDir(flare::Format("{}", dir));
+      for (auto&& subdir : subdirs) {
+        for (auto&& e : TryLookupCompilerIn(
+                 flare::Format("{}/{}/bin", dir, subdir.name))) {
+          AddEnvironmentTo(e, &temp_paths, &temp_envs);
+        }
+      }
     }
   }
 
@@ -111,42 +196,43 @@ CompilerRegistry::CompilerRegistry() {
   for (int i = 1; i != 100; ++i) {
     for (auto&& e : TryLookupCompilerIn(
              flare::Format("/opt/rh/devtoolset-{}/root/bin", i))) {
-      RegisterEnvironment(e);
+      AddEnvironmentTo(e, &temp_paths, &temp_envs);
     }
   }
 
-  // TODO(luobogao): Set up a timer to periodically recheck compilers present.
+  UpdateEnvironment(temp_paths, temp_envs);
 }
 
-CompilerRegistry::~CompilerRegistry() {}
+void CompilerRegistry::UpdateEnvironment(
+    const std::unordered_map<std::string, std::string>& temp_paths,
+    const std::vector<EnvironmentDesc>& temp_envs) {
+  // Compilers that are gone or newly-founded are printed after sorted. This is
+  // done for better diagnostics readability.
+  std::vector<std::string> gone, found;
 
-std::vector<EnvironmentDesc> CompilerRegistry::EnumerateEnvironments() const {
-  return environments_;
-}
-
-std::optional<std::string> CompilerRegistry::TryGetCompilerPath(
-    const EnvironmentDesc& env) const {
-  auto iter = compiler_paths_.find(GetEnvironmentString(env));
-  if (iter != compiler_paths_.end()) {
-    return iter->second;
+  for (auto iter = compiler_paths_.begin(); iter != compiler_paths_.end();
+       ++iter) {
+    if (temp_paths.count(iter->first) == 0) {
+      gone.emplace_back(iter->second);
+    }
   }
-  return {};
-}
+  for (auto iter = temp_paths.begin(); iter != temp_paths.end(); ++iter) {
+    if (compiler_paths_.count(iter->first) == 0) {
+      found.emplace_back(iter->second);
+    }
+  }
 
-std::string CompilerRegistry::GetEnvironmentString(
-    const EnvironmentDesc& desc) {
-  return desc.compiler_digest();
-}
+  std::sort(gone.begin(), gone.end());
+  std::sort(found.begin(), found.end());
+  for (auto&& e : gone) {
+    FLARE_LOG_INFO("Compiler [{}] has gone, forgetting about it.", e);
+  }
+  for (auto&& e : found) {
+    FLARE_LOG_INFO("Found compiler: {}", e);
+  }
 
-void CompilerRegistry::RegisterEnvironment(const std::string_view& path) {
-  EnvironmentDesc desc;
-  desc.set_compiler_digest(GetFileDigest(path));
-
-  if (compiler_paths_.count(GetEnvironmentString(desc)) == 0) {
-    FLARE_LOG_INFO("Found compiler: {}", path);
-    compiler_paths_[GetEnvironmentString(desc)] = path;
-    environments_.push_back(desc);
-  }  // Duplicates are ignored silently.
+  compiler_paths_ = temp_paths;
+  environments_ = temp_envs;
 }
 
 }  // namespace yadcc::daemon::cloud

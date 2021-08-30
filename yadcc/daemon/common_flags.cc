@@ -14,9 +14,9 @@
 
 #include "yadcc/daemon/common_flags.h"
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
-// For the moment the URI below MUST RESOLVES TO A SINGLE HOST. Our scheduler
+// For the moment the URI below MUST RESOLVE TO A SINGLE HOST. Our scheduler
 // does not support cluster configuration for now, running multiple schedulers
 // will likely lead to a disaster.
 //
@@ -33,14 +33,8 @@ DEFINE_string(cache_server_uri, "",
               "compilation result.");
 
 // I don't see much point in separate token for scheduler and token for cache..
-// (Unless we want to separate tokens for cache-reader and cache-writer.)
 DEFINE_string(token, "",
               "This token is used for accessing scheduler and cache server.");
-
-DEFINE_string(temporary_dir, "/dev/shm",
-              "For performance reasons, by default we store temporary files in "
-              "`/dev/shm`. If your machine can't afford this, you can specify "
-              "a different directory here.");
 
 namespace yadcc::daemon {
 
@@ -51,6 +45,21 @@ namespace yadcc::daemon {
 // Version 5: Support multiple version of compilers.
 // Version 6: Fixing BUG in version 4.
 // Version 7: Allow disable caching completely.
-int version_for_upgrade = 7;
+// Version 8: Collect all result files in compilation.
+// Version 9: Fixing BUG in version 8
+// Version 10: Moving non-cacheable macro detection to compile-server.
+// Version 11: Fixing protocol for reporting file name patches.
+// Version 12: Optimize the problem of repeated compilation of compilation tasks
+//             at the same time。
+// Version 13: Fixing possible crash when unpacking file buffers.
+// Version 14: Now we use a more uniform API convention to support multiple
+//             programming languages.
+// Version 15: Initial Java support.
+// Version 16: Multi-language support refactor.
+// Version 17: Fixing a bug that affects caching extra compilation info.
+// Version 18: Initial Scala support.
+// Version 19: Fixing possible crash in reading statistics of exiting process.
+// Version 20: New interface for C++.
+int version_for_upgrade = 20;
 
 }  // namespace yadcc::daemon

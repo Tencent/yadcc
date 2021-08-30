@@ -14,9 +14,12 @@
 
 #include "yadcc/common/io.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 #include "flare/base/buffer.h"
 #include "flare/base/logging.h"
@@ -40,6 +43,14 @@ TEST(Io, All) {
   FLARE_PCHECK(close(fds[0]) == 0);
 
   EXPECT_EQ("hello", flare::FlattenSlow(builder.DestructiveGet()));
+
+  WriteAll("./test_write_all", flare::CreateBufferSlow("my test data"));
+  int fd = open("./test_write_all", O_RDONLY);
+  EXPECT_GT(fd, 0);
+  flare::NoncontiguousBufferBuilder builder2;
+  ReadAppend(fd, &builder2);
+  EXPECT_EQ("my test data", flare::FlattenSlow(builder2.DestructiveGet()));
+  close(fd);
 }
 
 }  // namespace yadcc

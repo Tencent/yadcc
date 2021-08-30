@@ -14,24 +14,15 @@
 
 #include "yadcc/daemon/cloud/daemon_service_impl.h"
 
-#include <fcntl.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-
+#include <algorithm>
 #include <chrono>
-#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
 
-#include "flare/base/chrono.h"
-#include "flare/base/compression.h"
-#include "flare/base/crypto/blake3.h"
-#include "flare/base/encoding.h"
 #include "flare/base/enum.h"
-#include "flare/base/internal/cpu.h"
 #include "flare/base/string.h"
 #include "flare/fiber/timer.h"
 #include "flare/rpc/logging.h"
@@ -39,12 +30,11 @@
 #include "flare/rpc/rpc_server_controller.h"
 
 #include "yadcc/api/scheduler.flare.pb.h"
-#include "yadcc/daemon/cache_format.h"
 #include "yadcc/daemon/cloud/compiler_registry.h"
-#include "yadcc/daemon/cloud/distributed_cache_writer.h"
 #include "yadcc/daemon/cloud/execution_engine.h"
-#include "yadcc/daemon/cloud/sysinfo.h"
+#include "yadcc/daemon/cloud/remote_task/cxx_compilation_task.h"
 #include "yadcc/daemon/common_flags.h"
+#include "yadcc/daemon/sysinfo.h"
 
 using namespace std::literals;
 
@@ -56,45 +46,11 @@ DEFINE_int32(cpu_load_average_seconds, 15,
 DECLARE_string(servant_priority);
 
 namespace yadcc::daemon::cloud {
-namespace {
-
-struct JobContext {
-  std::mutex lock;  // Protects concurrent call to `PrepareForRead()`.
-
-  EnvironmentDesc env;
-  std::string invocation_arguments;
-  std::string source_digest;  // Used for updating compilation cache.
-  flare::NoncontiguousBuffer object_file;
-
-  // To cope with possible RPC retry, do NOT read it yourself, call
-  // `PrepareForRead()` and read `object_file` instead.
-  TemporaryFile temporary_object_file{FLAGS_temporary_dir};
-
-  void PrepareForRead() {
-    std::scoped_lock _(lock);
-
-    if (temporary_object_file.fd()) {
-      object_file = temporary_object_file.ReadAll();
-      temporary_object_file.Close();
-    }
-  }
-};
-
-flare::Compressor* GetZstdCompressor() {
-  thread_local auto compressor = flare::MakeCompressor("zstd");
-  return compressor.get();
-}
-
-flare::Decompressor* GetZstdDecompressor() {
-  thread_local auto decompressor = flare::MakeDecompressor("zstd");
-  return decompressor.get();
-}
-
-}  // namespace
 
 DaemonServiceImpl::DaemonServiceImpl(std::string network_location)
     : network_location_(std::move(network_location)) {
   FLARE_LOG_INFO("Serving at [{}].", network_location_);
+
   // `expires_in` passed to `Heartbeat` must be greater than timer interval to
   // a certain degree. This is required to compensate possible network delay (or
   // other delays).
@@ -102,11 +58,9 @@ DaemonServiceImpl::DaemonServiceImpl(std::string network_location)
                                       [this] { Heartbeat(10s); });
 }
 
-DaemonServiceImpl::~DaemonServiceImpl() {}
-
-void DaemonServiceImpl::QueueCompilationTask(
-    const QueueCompilationTaskRequest& request,
-    QueueCompilationTaskResponse* response,
+void DaemonServiceImpl::QueueCxxCompilationTask(
+    const QueueCxxCompilationTaskRequest& request,
+    QueueCxxCompilationTaskResponse* response,
     flare::RpcServerController* controller) {
   flare::AddLoggingItemToRpc(flare::EndpointGetIp(controller->GetRemotePeer()));
 
@@ -115,62 +69,17 @@ void DaemonServiceImpl::QueueCompilationTask(
     return;
   }
 
-  // Let's figure out which compiler should be used.
-  auto compiler =
-      CompilerRegistry::Instance()->TryGetCompilerPath(request.env_desc());
-  if (!compiler) {
-    controller->SetFailed(
-        STATUS_ENVIRONMENT_NOT_AVAILABLE,
-        "The requested environment is not available at this server.");
+  // Prepare the task.
+  auto task = flare::MakeRefCounted<CxxCompilationTask>();
+  if (auto status = task->Prepare(request, controller->GetRequestAttachment());
+      !status.ok()) {
+    controller->SetFailed(status.code(), status.message());
     return;
   }
-
-  if (request.compression_algorithm() != COMPRESSION_ALGORITHM_ZSTD) {
-    controller->SetFailed("Compression algorithm not supported.");
-    return;
-  }
-
-  FLARE_LOG_WARNING_IF_ONCE(request.disallow_cache_fill(),
-                            "Not implemented: Disallowing cache fill.");
-
-  std::string source_digest;
-
-  // TODO(luobogao): We can decompress the input on-the-fly to save some memory.
-  TemporaryFile standard_input(FLAGS_temporary_dir);
-  auto decompressed_source = flare::Decompress(
-      GetZstdDecompressor(), controller->GetRequestAttachment());
-  if (!decompressed_source) {
-    controller->SetFailed("Failed to decompress source code.");
-    return;
-  }
-  standard_input.Write(*decompressed_source);
-
-  // Initialize execution context.
-  auto job_context = std::make_shared<JobContext>();
-  job_context->env = request.env_desc();
-  job_context->invocation_arguments = request.invocation_arguments();
-  // Hashing the source code ourselves (as opposed to relying on user to provide
-  // it). "Defensive programming".
-  job_context->source_digest =
-      flare::EncodeHex(flare::Blake3(*decompressed_source));
-
-  // TODO(luobogao): Do some basic security checks on the invocation arguments
-  // to prevent threats such as data leak (by specifying path to a sensitive
-  // file as source input) etc.
-  //
-  // Or can we use some jail facility to accomplish this?
-  auto cmd =
-      flare::Format("{} {} -o {}", *compiler, request.invocation_arguments(),
-                    job_context->temporary_object_file.GetPath());
 
   // Submit the command to our execution engine.
-  auto task_id = ExecutionEngine::Instance()->TryQueueCommandForExecution(
-      request.task_grant_id(), cmd,
-      ExecutionEngine::Input{
-          .standard_input = std::move(standard_input),
-          .standard_output = TemporaryFile{FLAGS_temporary_dir},
-          .standard_error = TemporaryFile{FLAGS_temporary_dir},
-          .context = job_context});
+  auto task_id =
+      ExecutionEngine::Instance()->TryQueueTask(request.task_grant_id(), task);
   if (!task_id) {
     controller->SetFailed(STATUS_HEAVILY_LOADED,
                           flare::Format("Too many compilation tasks in queue. "
@@ -190,7 +99,20 @@ void DaemonServiceImpl::QueueCompilationTask(
 
   // Fill the response the return back to our caller.
   response->set_task_id(*task_id);
-  response->set_status(COMPILATION_TASK_STATUS_RUNNING);
+}
+
+void DaemonServiceImpl::ReferenceTask(const ReferenceTaskRequest& request,
+                                      ReferenceTaskResponse* response,
+                                      flare::RpcServerController* controller) {
+  if (!IsTokenAcceptable(request.token())) {
+    controller->SetFailed(STATUS_ACCESS_DENIED);
+    return;
+  }
+
+  if (!ExecutionEngine::Instance()->TryReferenceTask(request.task_id())) {
+    controller->SetFailed(STATUS_TASK_NOT_FOUND);
+  }
+  return;
 }
 
 void DaemonServiceImpl::WaitForCompilationOutput(
@@ -217,8 +139,8 @@ void DaemonServiceImpl::WaitForCompilationOutput(
   }
 
   // Let's see if the job is done.
-  auto output = ExecutionEngine::Instance()->WaitForCompletion(
-      request.task_id(), desired_wait);
+  auto output =
+      ExecutionEngine::Instance()->WaitForTask(request.task_id(), desired_wait);
   if (!output) {
     auto code = output.error();
     if (code == ExecutionStatus::Failed) {
@@ -235,44 +157,14 @@ void DaemonServiceImpl::WaitForCompilationOutput(
   }
 
   // It is, fill the response.
+  auto task = static_cast<RemoteTask*>(output->Get());
   response->set_status(COMPILATION_TASK_STATUS_DONE);
-  response->set_exit_code(output->exit_code);
-  // `stdout` / `stderr` should be small (or better yet, empty) for most of
-  // times as we don't expect compilation to fail (or with warning) too often.
-  response->set_output(flare::FlattenSlow(output->standard_output));
-  response->set_error(flare::FlattenSlow(output->standard_error));
+  response->set_exit_code(task->GetExitCode());
+  response->set_output(task->GetStandardOutput());
+  response->set_error(task->GetStandardError());
   response->set_compression_algorithm(COMPRESSION_ALGORITHM_ZSTD);
-
-  if (output->exit_code == 0) {  // Deal with the resulting object file then.
-    // FIXME: Most of the things below should be done immediately upon task
-    // completion, instead of here.
-
-    auto context = static_cast<JobContext*>(output->context.get());
-    context->PrepareForRead();
-
-    // TODO(luobogao): We can compress the result immediately after compilation
-    // finishes to save memory.
-    //
-    // FIXME: We'd recompress the object file and waste CPU cycles if the RPC is
-    // retried.
-    auto compressed_bytes =
-        flare::Compress(GetZstdCompressor(), context->object_file);
-    FLARE_CHECK(compressed_bytes);  // How can compression fail?
-
-    // This doesn't look quite right. I'm sure we'd refactor it out later, to
-    // update the cache once compilation is done (instead of upon being waited
-    // by the submitter.). But let's get it working first.
-    //
-    // FIXME: On RPC retry we'll update the cache more than once.
-    // FIXME: How to disable caching here?
-    auto cache_key = GetCacheEntryKey(
-        context->env, context->invocation_arguments, context->source_digest);
-    (void)DistributedCacheWriter::Instance()->AsyncWrite(
-        cache_key, response->exit_code(), response->output(), response->error(),
-        *compressed_bytes);  // NOT waited
-
-    controller->SetResponseAttachment(*compressed_bytes);
-  }
+  *response->mutable_extra_info() = task->GetExtraInfo();
+  controller->SetResponseAttachment(task->GetOutputFilePack());
 }
 
 void DaemonServiceImpl::FreeTask(const FreeTaskRequest& request,
@@ -317,10 +209,8 @@ void DaemonServiceImpl::Heartbeat(std::chrono::nanoseconds expires_in) {
     req.set_capacity(*capacity);
   } else {
     req.set_capacity(0);
-    // Hmmm..
     req.set_not_accepting_task_reason(
-        static_cast<scheduler::NotAcceptingTaskReason>(
-            flare::underlying_value(capacity.error())));
+        flare::underlying_value(capacity.error()));
   }
   req.set_num_processors(GetNumberOfProcessors());
   // If our try is failed, we get 1min loadavg instead.
@@ -329,8 +219,13 @@ void DaemonServiceImpl::Heartbeat(std::chrono::nanoseconds expires_in) {
   for (auto&& e : CompilerRegistry::Instance()->EnumerateEnvironments()) {
     *req.add_env_descs() = e;
   }
-  for (auto&& e : ExecutionEngine::Instance()->EnumerateGrantOfRunningTask()) {
-    req.add_running_tasks(e);
+  for (auto&& e : ExecutionEngine::Instance()->EnumerateTasks()) {
+    auto running_task_info = req.add_running_tasks();
+    running_task_info->set_servant_location(network_location_);
+    running_task_info->set_task_grant_id(e.task_grant_id);
+    running_task_info->set_servant_task_id(e.servant_task_id);
+    running_task_info->set_task_digest(
+        static_cast<RemoteTask*>(e.task.Get())->GetDigest());
   }
   auto result = stub.Heartbeat(req, &ctlr);
   if (!result) {

@@ -8,7 +8,7 @@
 
 另外作为一项针对延迟的优化，小文件`yadcc`可能会本地编译，可以通过`YADCC_COMPILE_ON_CLOUD_SIZE_THRESHOLD = 0`屏蔽这一行为。
 
-通常可以通过这样的命令来测试基本流程（`-c`参数为必须，否则`yadcc`会因为这个名字不（止）是编译而直接本地执行。）：`YADCC_LOG_LEVEL=0 YADCC_COMPILE_ON_CLOUD_SIZE_THRESHOLD=0 /path/to/yadcc g++ ./test.cc -c`。
+通常可以通过这样的命令来测试基本流程（`-c`参数为必须，否则`yadcc`会因为这个命令不（止）是编译而直接本地执行。）：`YADCC_LOG_LEVEL=0 YADCC_COMPILE_ON_CLOUD_SIZE_THRESHOLD=0 /path/to/yadcc g++ ./test.cc -c`。
 
 样例输出：
 
@@ -182,5 +182,3 @@
 - Q：集群中所有机器的`capacity_available`都为0。
 
   A：默认情况下我们对机器是否提供服务、提供的服务能力都相对保守。只有高配（24逻辑核及以上）的非容器环境，默认配置下才会主动提供服务。可以通过`--max_remote_tasks`参数来覆盖这一行为，明确要求对外提供服务。
-
-  另外，为了在一定程度上避免由于编译器内存开销大导致的死机、触发OOM killer的情况，默认情况下对于可用内存小于10G的机器我们不会分发任务，可参考[scheduler](scheduler.md)的`--servant_min_memory_for_accepting_new_task`参数。

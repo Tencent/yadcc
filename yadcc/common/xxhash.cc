@@ -14,7 +14,7 @@
 
 #include "yadcc/common/xxhash.h"
 
-#include "thirdparty/xxhash/xxhash.h"
+#include "xxhash/xxhash.h"
 
 namespace yadcc {
 

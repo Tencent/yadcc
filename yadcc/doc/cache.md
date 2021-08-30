@@ -38,7 +38,9 @@ L1缓存毫无疑问是基于内存，直觉上是缓存热点数据，并采用
 
 缓存服务器有如下参数可以配置：
 
-- `--acceptable_tokens`：逗号分隔的一系列`token`。缓存服务器会校验请求中的`token`，如果不匹配于这一参数中的任何一个，则会拒绝请求。
+- `--acceptable_user_tokens`：逗号分隔的一系列`token`，用于标识客户端机器。调度器会校验请求中的`token`，如果不匹配于这一参数中的任何一个，则会拒绝请求。
+
+- `--acceptable_servant_tokens`：同上，用于标识编译机。
 
 - `--cache_engine`：配置L2缓存的存储方案，目前仅支持NULL和磁盘方案，对应选项：`null`，`disk`。示例：`--cache_engine=disk`。
 
@@ -56,9 +58,15 @@ L1缓存有如下参数可以配置：
 
 基于磁盘的L2有如下参数可以配置：
 
-- `--cache_dirs`：一个或多个用于保存编译缓存的目录大小上限及路径。目录权重和路径之间以`,`分割。目录之间以`:`分割。如`--cache_dirs=10G,/path/to/disk1:20G,/path/to/disk2`。
+- `--disk_engine_cache_dirs`：一个或多个用于保存编译缓存的目录大小上限及路径。目录权重和路径之间以`,`分割。目录之间以`:`分割。如`--disk_engine_cache_dirs=10G,/path/to/disk1:20G,/path/to/disk2`。
     内部而言，我们对缓存的Key进行一致性哈希后决定使用哪一个目录，因此增加或删除目录不会显著的降低缓存命中率。（之后随着缓存内容的更新，命中率也会逐步回升。）
     如果机器配备了多个物理磁盘（或网络磁盘），这样可以实现类似于软磁盘阵列的效果，提升整体吞吐。
+
+- `--disk_engine_action_on_misplaced_cache_entry`：`yadcc-cache`启动时会扫描`disk_engine_cache_dirs`中的文件，如果文件所在的目录和预期不符（如增加了新的目录至`disk_engine_cache_dirs`），`yadcc-cache`将会根据这儿指定的行为操作：
+
+  - `delete`：删除相应缓存项；
+  - `move`：将相应的缓存项移动到其所属的目录；
+  - `ignore`：忽略。
 
 ## 缓存的布隆过滤器
 

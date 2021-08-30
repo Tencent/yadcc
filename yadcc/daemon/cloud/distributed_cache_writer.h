@@ -22,6 +22,7 @@
 #include "flare/base/future.h"
 
 #include "yadcc/api/cache.flare.pb.h"
+#include "yadcc/daemon/cache_format.h"
 
 namespace yadcc::daemon::cloud {
 
@@ -43,10 +44,8 @@ class DistributedCacheWriter {
   ~DistributedCacheWriter();
 
   // Write a compilation result into the cache.
-  flare::Future<bool> AsyncWrite(const std::string& key, int exit_code,
-                                 const std::string& standard_output,
-                                 const std::string& standard_error,
-                                 const flare::NoncontiguousBuffer& buffer);
+  flare::Future<bool> AsyncWrite(const std::string& key,
+                                 const CacheEntry& cache_entry);
 
   void Stop();
   void Join();

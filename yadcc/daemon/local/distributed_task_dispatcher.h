@@ -18,13 +18,16 @@
 #include <chrono>
 #include <cinttypes>
 #include <optional>
-#include <queue>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "flare/base/buffer.h"
+#include "flare/base/expected.h"
 #include "flare/base/exposed_var.h"
 #include "flare/base/ref_ptr.h"
 #include "flare/base/status.h"
+#include "flare/base/type_index.h"
 #include "flare/fiber/condition_variable.h"
 #include "flare/fiber/fiber.h"
 #include "flare/fiber/latch.h"
@@ -32,33 +35,13 @@
 
 #include "yadcc/api/daemon.flare.pb.h"
 #include "yadcc/api/scheduler.flare.pb.h"
+#include "yadcc/daemon/local/config_keeper.h"
+#include "yadcc/daemon/local/distributed_cache_reader.h"
+#include "yadcc/daemon/local/distributed_task.h"
+#include "yadcc/daemon/local/running_task_keeper.h"
+#include "yadcc/daemon/local/task_grant_keeper.h"
 
 namespace yadcc::daemon::local {
-
-// @sa: `client/env_options.h`
-enum class CacheControl {
-  Disallow = 0,  // Don't touch cache.
-  Allow = 1,     // Use existing one, or fill it on cache miss.
-  Refill = 2  // Do not use the existing cache, but (re)fills it on completion.
-};
-
-struct CompilationTask {
-  pid_t requestor_pid;
-  EnvironmentDesc env_desc;
-  std::string source_path;
-  std::string invocation_arguments;
-  CacheControl cache_control;
-  // @sa: `GetCacheEntryKey` in `cache_format.h`. Not applicable if caching is
-  // disabled.
-  std::string source_digest;
-  flare::NoncontiguousBuffer preprocessed_source;  // Zstd compressed.
-};
-
-struct CompilationOutput {
-  int exit_code;
-  std::string standard_output, standard_error;
-  flare::NoncontiguousBuffer object_file;
-};
 
 // This class accepts tasks from our HTTP handler and schedule the tasks to the
 // cloud as it sees fit.
@@ -69,56 +52,77 @@ class DistributedTaskDispatcher {
   DistributedTaskDispatcher();
   ~DistributedTaskDispatcher();
 
-  enum WaitStatus { OK, Timeout, NotFound };
+  enum class WaitStatus { OK, Timeout, NotFound };
 
-  // Schedule a compilation task.
+  // Schedule a task for remote execution.
   //
   // If the task can't be scheduled before `start_deadline`, it'll be aborted
   // (and `WaitForTask` will report the task as failed).
   //
   // Note that we check deadlines in a coarse time granularity, so don't expect
-  // it be precise.
-  //
-  // TODO(luobogao): running_timeout?
-  std::uint64_t QueueTask(CompilationTask task,
+  // it to be precise.
+  template <class T>
+  std::uint64_t QueueTask(std::unique_ptr<T> task,
                           std::chrono::steady_clock::time_point start_deadline);
 
   // Wait for a specific task to complete.
-  WaitStatus WaitForTask(std::uint64_t task_id,
-                         std::chrono::nanoseconds timeout,
-                         CompilationOutput* output);
+  //
+  // Note that `T` must be an exact match of type that was used for calling
+  // `QueueTask`.
+  template <class T>
+  flare::Expected<std::unique_ptr<T>, WaitStatus> WaitForTask(
+      std::uint64_t task_id, std::chrono::nanoseconds timeout);
 
   void Stop();
   void Join();
 
  private:
+  FRIEND_TEST(HttpServiceImpl, Cxx);
+
   class TaskDesc;
   class GrantDesc;
 
   enum class ServantWaitStatus { Running, RpcError, Failed };
 
-  // This method does everything necessary to complete a task, including:
+  // Submit a task. `type` will be saved and compared on waiting for the task.
   //
-  // - Looking up cache.
-  // - (On cache miss) Submitting the task to the cloud.
-  // - (On cache miss) Polling task state until it's completed.
-  // - Signal the task to wake up waiter (if any).
+  // TBH `dynamic_cast` perfectly suits our needs here, yet it is discouraged by
+  // our coding convention. Besides, I'm biased against it.
+  std::uint64_t QueueDistributedTask(
+      flare::TypeIndex type, std::unique_ptr<DistributedTask> task,
+      std::chrono::steady_clock::time_point start_deadline);
+
+  // Wait for task with the specifid type and ID.
+  flare::Expected<std::unique_ptr<DistributedTask>, WaitStatus>
+  WaitForDistributedTask(flare::TypeIndex type, std::uint64_t task_id,
+                         std::chrono::nanoseconds timeout);
+
+  // This method does everything necessary to complete a task.
   //
   // It's executed in its dedicated fiber.
   void PerformOneTask(flare::RefPtr<TaskDesc> task);
 
-  // Submit task to the servant we've just be granted.
-  //
-  // Returns task ID allocated by the servant.
-  flare::Expected<std::uint64_t, flare::Status> SubmitTaskToServant(
-      std::uint64_t grant_id, const TaskDesc& task,
-      cloud::DaemonService_SyncStub* to);
+  // If allowed, this method use cached result to satisfy the task.
+  bool TryReadCacheIfAllowed(TaskDesc* task);
+
+  // If the same source code is being compiled elsewhere, this method reuse that
+  // task.
+  bool TryGetExistingTaskResult(TaskDesc* task);
+
+  // This method submits task to a compile-server and wait for its completion.
+  void StartNewServantTask(TaskDesc* task);
 
   // Wait on `servant` for task with ID `servant_task_id`.
   //
   // Returns `std::nullopt` if the task is still running on return.
-  flare::Expected<CompilationOutput, ServantWaitStatus> WaitServantForTask(
+  flare::Expected<DistributedTaskOutput, ServantWaitStatus> WaitServantForTask(
       std::uint64_t servant_task_id, cloud::DaemonService_SyncStub* from);
+
+  void WaitServantForTaskWithRetry(TaskDesc* task,
+                                   cloud::DaemonService_SyncStub* from);
+
+  void FreeServantTask(std::uint64_t servant_task_id,
+                       cloud::DaemonService_SyncStub* from);
 
   Json::Value DumpInternals();
 
@@ -135,8 +139,11 @@ class DistributedTaskDispatcher {
   // Frees tasks that has been completed for a while and no one ever read it.
   void OnCleanupTimer();
 
+  std::optional<std::vector<std::pair<std::string, flare::NoncontiguousBuffer>>>
+  TryParseFiles(const flare::NoncontiguousBuffer& bytes);
+
  private:
-  enum TaskState {
+  enum class TaskState {
     // The task has not yet run.
     Pending,
 
@@ -157,7 +164,8 @@ class DistributedTaskDispatcher {
 
     // Immutable since creation.
     std::uint64_t task_id;
-    CompilationTask task;
+    flare::TypeIndex task_type;
+    std::unique_ptr<DistributedTask> task;
     std::chrono::steady_clock::time_point start_deadline;
 
     // Thread-safe itself. Signaled after completion only. No consistency issue
@@ -182,7 +190,7 @@ class DistributedTaskDispatcher {
     std::chrono::steady_clock::time_point ready_at{};
     std::chrono::steady_clock::time_point dispatched_at{};
     std::chrono::steady_clock::time_point completed_at{};
-    CompilationOutput output;
+    DistributedTaskOutput output;
 
     ///////////////////////////////////////////////////////
     // Internal states go below. (Protected by `lock`.)  //
@@ -197,99 +205,6 @@ class DistributedTaskDispatcher {
     std::chrono::steady_clock::time_point last_keep_alive_at;
   };
 
-  // Describes a task grant alloacted by the scheduler.
-  struct GrantDesc {
-    // Network delay has been compensated by the fetcher by substracting a
-    // period of time from `expires_at`. Don't do that yourself again.
-    std::chrono::steady_clock::time_point expires_at;
-    std::uint64_t grant_id;
-    std::string servant_location;
-
-    bool operator<(const GrantDesc& other) const {
-      return expires_at > other.expires_at;
-    }
-  };
-
-  // This class helps us to grab, and if necessary, prefetch grants for starting
-  // new tasks, from our scheduler.
-  class TaskGrantKeeper {
-   public:
-    TaskGrantKeeper();
-
-    // Grab a grant for starting new task.
-    std::optional<GrantDesc> Get(const EnvironmentDesc& desc,
-                                 const std::chrono::nanoseconds& timeout);
-
-    // Free a previous allocated grant.
-    void Free(std::uint64_t grant_id);
-
-    void Stop();
-    void Join();
-
-   private:
-    struct PerEnvGrantKeeper;
-
-    // Wake up the fiber for fetching new grants.
-    void WakeGrantFetcherFor(const EnvironmentDesc& desc);
-
-    void GrantFetcherProc(PerEnvGrantKeeper* keeper);
-
-   private:
-    struct PerEnvGrantKeeper {
-      EnvironmentDesc env_desc;  // Our environment.
-
-      flare::fiber::Mutex lock;
-      flare::fiber::ConditionVariable need_more_cv, available_cv;
-
-      // Number of waiters waiting on us.
-      int waiters = 0;
-
-      // Available grants. They'll either be handed to `waiters`, or in case we
-      // have spare ones, save here.
-      //
-      // Besides, if we prefetched some grants, they're saved here too.
-      // Prefetching helps to reduce latency in critical path.
-      std::queue<GrantDesc> remaining;
-
-      // Fiber for fetching more grants.
-      flare::Fiber fetcher;
-    };
-
-    scheduler::SchedulerService_AsyncStub scheduler_stub_;
-
-    flare::fiber::Mutex lock_;
-    std::atomic<bool> leaving_ = false;
-
-    // We never clean up this map, in case the client keep sending us random
-    // environment, this will be a DoS vulnerability.
-    std::unordered_map<std::string, std::unique_ptr<PerEnvGrantKeeper>>
-        keepers_;
-  };
-
-  class ConfigKeeper {
-   public:
-    ConfigKeeper();
-
-    std::string GetServingDaemonToken() const {
-      std::scoped_lock _(lock_);
-      return serving_daemon_token_;
-    }
-
-    void Start();
-    void Stop();
-    void Join();
-
-   private:
-    void OnFetchConfig();
-
-   private:
-    std::uint64_t config_fetcher_;
-    scheduler::SchedulerService_SyncStub scheduler_stub_;
-
-    mutable std::mutex lock_;
-    std::string serving_daemon_token_;
-  };
-
   scheduler::SchedulerService_SyncStub scheduler_stub_;
 
   std::uint64_t abort_timer_;        // Aborts tasks queued for too long.
@@ -299,12 +214,41 @@ class DistributedTaskDispatcher {
 
   ConfigKeeper config_keeper_;
   TaskGrantKeeper task_grant_keeper_;
+  RunningTaskKeeper running_task_keeper_;
 
   flare::fiber::Mutex tasks_lock_;
   std::unordered_map<std::uint64_t, flare::RefPtr<TaskDesc>> tasks_;
 
+  std::atomic<std::uint64_t> hit_cache_{0};
+  std::atomic<std::uint64_t> reuse_existing_result_{0};
+  std::atomic<std::uint64_t> actually_run_{0};
+
   flare::ExposedVarDynamic<Json::Value> internal_exposer_;
 };
+
+template <class T>
+std::uint64_t DistributedTaskDispatcher::QueueTask(
+    std::unique_ptr<T> task,
+    std::chrono::steady_clock::time_point start_deadline) {
+  return QueueDistributedTask(flare::GetTypeIndex<T>(), std::move(task),
+                              start_deadline);
+}
+
+template <class T>
+flare::Expected<std::unique_ptr<T>, DistributedTaskDispatcher::WaitStatus>
+DistributedTaskDispatcher::WaitForTask(std::uint64_t task_id,
+                                       std::chrono::nanoseconds timeout) {
+  auto result =
+      WaitForDistributedTask(flare::GetTypeIndex<T>(), task_id, timeout);
+  if (result) {
+    // Down-casting it to the resulting type.
+    //
+    // Unless there's a bug in our implementation, runtime type of `result` must
+    // match `T`.
+    return std::unique_ptr<T>(static_cast<T*>(result->release()));
+  }
+  return result.error();
+}
 
 }  // namespace yadcc::daemon::local
 

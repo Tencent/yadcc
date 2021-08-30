@@ -25,7 +25,7 @@
 
 - `--servant_priority`：可以指定为`user` / `dedicated`，不指定时默认`user`。如果配置为`dedicated`，则会向调度器报告这是一台“专用编译机”。调度器会认为专用编译机负载、性能稳定（没有外接负载）、并会优先将任务指派至专用编译机。（具体逻辑可参考[调度算法](scheduler.md)。）
 
-- `--max_remote_tasks`：对于编译机而言，这个参数控制了最大的并发任务数。真机环境默认为`核数 * 0.4`，容器环境由于机器资源不好确定（如CGroups限制等）默认不接受任务。**如果编译机运行在容器中，可以根据实际情况通过这一参数手动指定**。
+- `--max_remote_tasks`：对于编译机而言，这个参数控制了最大的并发任务数。**默认值为不接受任务，对于编译机需要手动指定这一参数**。
 
 - `--extra_compiler_dirs`：如果希望将不在`PATH`中的编译器也加入这一编译机所能提供的编译环境中，可以通过这一参数指定一系列`/path1/to/compiler/bin:/path2/to/compiler/bin`。
 
@@ -38,6 +38,10 @@
 - `--max_local_tasks`：本地并发任务数，真机环境默认为`核数 / 2`，容器环境为`cfs_quota_us / cfs_period_us / 2`。至少为1。
 
 - `--lightweight_local_task_overprovisioning_ratio`：针对预处理等轻量任务，我们会额外允许一些任务并发度，这个“额外”的部分为`max_local_tasks * lightweight_local_task_overprovisioning_ratio`。
+
+- `--min_memory_for_starting_new_task`：出于保护目的，对于编译机而言，如果发现本机内存已经不足这一配置，则会主动拒绝任务。但是需要注意的是，这并不是一个万全的措施。单个编译进程随着编译的进展，内存占用会逐渐上涨，这种情况下这一参数无法起到保护作用。
+
+- `--poor_machine_threshold`：我们默认不会向配置较差的机器发送编译任务（`--servant_priority=dedicated`会忽略这一选项）。如果机器的CPU核心数小于或等于这一参数，则这台机器会认为是“配置较差”的。
 
 ## 处理本地请求
 

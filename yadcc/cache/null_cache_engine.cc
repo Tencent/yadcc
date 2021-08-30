@@ -28,11 +28,10 @@ std::optional<flare::NoncontiguousBuffer> NullCacheEngine::TryGet(
 void NullCacheEngine::Put(const std::string& key,
                           const flare::NoncontiguousBuffer& bytes) {}
 
-std::vector<std::string> NullCacheEngine::Purge() {
-  return std::vector<std::string>();
-}
+void NullCacheEngine::Purge() {}
 
 Json::Value NullCacheEngine::DumpInternals() const { return Json::Value(); }
 
 FLARE_REGISTER_CLASS_DEPENDENCY(cache_engine_registry, "null", NullCacheEngine);
+
 }  // namespace yadcc::cache

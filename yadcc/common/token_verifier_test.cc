@@ -14,12 +14,12 @@
 
 #include "yadcc/common/token_verifier.h"
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/googletest/gtest/gtest.h"
+#include <string>
+
+#include "gflags/gflags.h"
+#include "gtest/gtest.h"
 
 using namespace std::literals;
-
-DECLARE_string(acceptable_tokens);
 
 namespace yadcc {
 
@@ -35,8 +35,8 @@ TEST(TokenVerifier, Normal) {
 }
 
 TEST(TokenVerifier, FromGFlags) {
-  FLAGS_acceptable_tokens = "token1,token2";
-  auto verifier = MakeTokenVerifierFromFlag();
+  std::string test_tokens = "token1,token2";
+  auto verifier = MakeTokenVerifierFromFlag(test_tokens);
   EXPECT_TRUE(verifier->Verify("token1"));
   EXPECT_TRUE(verifier->Verify("token2"));
   EXPECT_FALSE(verifier->Verify("token3"));
@@ -44,8 +44,8 @@ TEST(TokenVerifier, FromGFlags) {
 }
 
 TEST(TokenVerifier, FromGFlags2) {
-  FLAGS_acceptable_tokens = "token1,token2,";  // Empty token is allowed.
-  auto verifier = MakeTokenVerifierFromFlag();
+  std::string test_tokens = "token1,token2,";  // Empty token is allowed.
+  auto verifier = MakeTokenVerifierFromFlag(test_tokens);
   EXPECT_TRUE(verifier->Verify("token1"));
   EXPECT_TRUE(verifier->Verify("token2"));
   EXPECT_FALSE(verifier->Verify("token3"));

@@ -18,15 +18,17 @@
 #include <unordered_set>
 #include <utility>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/logging.h"
 #include "flare/base/string.h"
 
-DEFINE_string(
-    acceptable_tokens, "",
-    "List of acceptable tokens. This option is not always respected. The "
-    "program may specify its own list of tokens from other sources.");
+DEFINE_string(acceptable_user_tokens, "",
+              "List of acceptable client tokens. This option is not always "
+              "respected. The client program may specify its own list of "
+              "tokens from other sources.");
+DEFINE_string(acceptable_servant_tokens, "",
+              "List of acceptable servant tokens.");
 
 namespace yadcc {
 
@@ -50,12 +52,12 @@ bool TokenVerifier::Verify(const std::string& token) const noexcept {
   return recognized_tokens_.count(token) != 0;
 }
 
-std::unique_ptr<TokenVerifier> MakeTokenVerifierFromFlag() {
-  FLARE_CHECK(!FLAGS_acceptable_tokens.empty(),
+std::unique_ptr<TokenVerifier> MakeTokenVerifierFromFlag(
+    const std::string& flags) {
+  FLARE_CHECK(!flags.empty(),
               "You should provide at least one recognized token.");
 
-  auto tokens =
-      flare::Split(FLAGS_acceptable_tokens, ",", true /* keep_empty */);
+  auto tokens = flare::Split(flags, ",", true /* keep_empty */);
 
   // ... Well dealing with `std::string_view` is hard.
   std::unordered_set<std::string> translated;

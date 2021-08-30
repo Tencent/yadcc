@@ -16,8 +16,8 @@
 
 #include <chrono>
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/xxhash/xxhash.h"
+#include "gflags/gflags.h"
+#include "xxhash/xxhash.h"
 
 #include "flare/base/compression.h"
 #include "flare/base/never_destroyed.h"
@@ -87,10 +87,6 @@ std::optional<CacheEntry> DistributedCacheReader::TryRead(
     // RPC failures are logged.
     FLARE_LOG_WARNING_IF(result.error().code() != cache::STATUS_NOT_FOUND,
                          "Failed to load cache: {}", result.error().ToString());
-
-    // TODO(luobogao): Report cache miss rate if the error is
-    // `STATUS_NOT_FOUND`. Given that we've checked our Bloom Filter, this
-    // shouldn't be high, otherwise something is buggy.
     return std::nullopt;
   }
 
@@ -107,7 +103,9 @@ std::optional<CacheEntry> DistributedCacheReader::TryRead(
 }
 
 void DistributedCacheReader::Stop() {
-  flare::fiber::KillTimer(reload_bf_timer_);
+  if (!FLAGS_cache_server_uri.empty()) {
+    flare::fiber::KillTimer(reload_bf_timer_);
+  }
 }
 
 void DistributedCacheReader::Join() {

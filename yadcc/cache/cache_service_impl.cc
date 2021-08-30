@@ -18,16 +18,18 @@
 #include <memory>
 #include <string>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/compression.h"
 #include "flare/base/random.h"
 #include "flare/base/string.h"
+
 #include "flare/fiber/timer.h"
 #include "flare/rpc/logging.h"
 #include "flare/rpc/rpc_server_controller.h"
 
 #include "yadcc/common/parse_size.h"
+#include "yadcc/common/token_verifier.h"
 
 using namespace std::literals;
 
@@ -69,8 +71,11 @@ CacheServiceImpl::CacheServiceImpl()
   // Timers are started in `Start()`.
   auto max_size = TryParseSize(FLAGS_max_in_memory_cache_size);
   FLARE_CHECK(max_size, "Flag max_in_memory_cache_size is invalid.");
-  in_memory_cache_ = std::make_unique<InMemoryCache>(*max_size);
+  is_user_verifier_ = MakeTokenVerifierFromFlag(FLAGS_acceptable_user_tokens);
+  is_servant_verifier_ =
+      MakeTokenVerifierFromFlag(FLAGS_acceptable_servant_tokens);
   cache_ = cache_engine_registry.New(FLAGS_cache_engine);
+  in_memory_cache_ = std::make_unique<InMemoryCache>(*max_size);
 }
 
 void CacheServiceImpl::FetchBloomFilter(
@@ -78,7 +83,7 @@ void CacheServiceImpl::FetchBloomFilter(
     flare::RpcServerController* controller) {
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
@@ -122,22 +127,22 @@ void CacheServiceImpl::TryGetEntry(const TryGetEntryRequest& request,
                                    flare::RpcServerController* controller) {
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
 
   auto bytes = in_memory_cache_->TryGet(request.key());
-  if (bytes) {
-    controller->SetResponseAttachment(*bytes);
-    return;
-  }
-
-  bytes = cache_->TryGet(request.key());
   if (!bytes) {
+    bytes = cache_->TryGet(request.key());  // Try L2 then.
+  }
+  if (!bytes) {
+    cache_miss_.fetch_add(1, std::memory_order_relaxed);
     controller->SetFailed(STATUS_NOT_FOUND, "Cache miss.");
     return;
   }
+
+  cache_hits_.fetch_add(1, std::memory_order_relaxed);
   in_memory_cache_->Put(request.key(), *bytes);
   controller->SetResponseAttachment(*bytes);
 }
@@ -147,7 +152,7 @@ void CacheServiceImpl::PutEntry(const PutEntryRequest& request,
                                 flare::RpcServerController* controller) {
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_servant_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
@@ -205,6 +210,10 @@ Json::Value CacheServiceImpl::DumpInternals() {
   Json::Value jsv;
   jsv["l1"] = in_memory_cache_->DumpInternals();
   jsv["l2"] = cache_->DumpInternals();
+  jsv["hits"] =
+      static_cast<Json::UInt64>(cache_hits_.load(std::memory_order_relaxed));
+  jsv["misses"] =
+      static_cast<Json::UInt64>(cache_miss_.load(std::memory_order_relaxed));
   return jsv;
 }
 

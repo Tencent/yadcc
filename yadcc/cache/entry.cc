@@ -24,13 +24,16 @@ DEFINE_int32(port, 8337, "Port we'll be listening on.");
 
 FLARE_OVERRIDE_FLAG(logbufsecs, 0);
 
+// Our packets are large (~1.5M in average, in our production environment.).
+FLARE_OVERRIDE_FLAG(flare_buffer_block_size, "64K");
+
 // We're disk I/O intensive, and will likely be blocked (waiting on disk)
 // frequently, so start some spare threads.
 FLARE_OVERRIDE_FLAG(flare_concurrency_hint, 32);
 
 // As obvious.
-FLARE_OVERRIDE_FLAG(flare_rpc_server_max_packet_size, 67108864);
-FLARE_OVERRIDE_FLAG(flare_rpc_channel_max_packet_size, 67108864);
+FLARE_OVERRIDE_FLAG(flare_rpc_server_max_packet_size, 128 * 1024 * 1024);
+FLARE_OVERRIDE_FLAG(flare_rpc_channel_max_packet_size, 128 * 1024 * 1024);
 
 namespace yadcc::cache {
 

@@ -22,6 +22,23 @@
 
 namespace yadcc::cache {
 
+namespace {
+
+// As we're using 64K (Flare) buffer blocks, if the buffer block is not fully
+// filled, we risk wasting a lot of space.
+//
+// This method repacks `buffer` with a tightly-fit buffer, mitigating this
+// issue.
+flare::NoncontiguousBuffer CompactBuffer(
+    const flare::NoncontiguousBuffer& buffer) {
+  auto flatten = flare::FlattenSlow(buffer);
+  flare::NoncontiguousBuffer result;
+  result.Append(flare::MakeForeignBuffer(std::move(flatten)));
+  return result;
+}
+
+}  // namespace
+
 InMemoryCache::InMemoryCache(std::size_t max_size)
     : max_size_in_bytes_(max_size) {}
 
@@ -30,17 +47,18 @@ bool InMemoryCache::Put(const std::string& key,
   if (buffer.ByteSize() > max_size_in_bytes_) {
     return false;
   }
+  auto reshaped_buffer = CompactBuffer(buffer);
 
   std::scoped_lock _(lock_);
 
   // If the entry is already in our cache(means in t1 or t2), we replace the
   // content of the entry simplely.
   if (memory_buffer_mapper_.count(key)) {
-    UnsafeOverwrite(key, buffer);
+    UnsafeOverwrite(key, reshaped_buffer);
     return true;
   }
 
-  CacheEntry entry = {buffer, nullptr};
+  CacheEntry entry = {reshaped_buffer, nullptr};
 
   auto entry_in_phantom = phantom_entry_mapper_.find(key);
   // The case the entry is in phantom list. We push it back into t1 or t2 cache

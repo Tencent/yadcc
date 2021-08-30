@@ -17,7 +17,13 @@ load('//flare/tools/build_rules.bld', 'cc_flare_library')
 proto_library(
   name = 'env_desc_proto',
   srcs = 'env_desc.proto',
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
+)
+
+proto_library(
+  name = 'patch_proto',
+  srcs = 'patch.proto',
+  visibility = '//yadcc/...',
 )
 
 proto_library(
@@ -25,8 +31,9 @@ proto_library(
   srcs = 'daemon.proto',
   deps = [
     ':env_desc_proto',
+    ':patch_proto',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_flare_library(
@@ -35,7 +42,7 @@ cc_flare_library(
   deps = [
     ':daemon_proto',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 proto_library(
@@ -44,7 +51,7 @@ proto_library(
   deps = [
     ':env_desc_proto',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_flare_library(
@@ -53,13 +60,13 @@ cc_flare_library(
   deps = [
     ':scheduler_proto',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 proto_library(
   name = 'cache_proto',
   srcs = 'cache.proto',
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_flare_library(
@@ -68,5 +75,14 @@ cc_flare_library(
   deps = [
     ':cache_proto',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
+)
+
+proto_library(
+  name = 'extra_info_proto',
+  srcs = 'extra_info.proto',
+  deps = [
+    ':patch_proto'
+  ],
+  visibility = '//yadcc/...',
 )

@@ -17,8 +17,8 @@
 #include <atomic>
 #include <chrono>
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gflags/gflags.h"
+#include "gtest/gtest.h"
 
 #include "flare/fiber/fiber.h"
 #include "flare/fiber/this_fiber.h"
