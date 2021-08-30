@@ -339,11 +339,12 @@ DiskCacheEngine::GetKeyAndByteSizePerDir() const {
   std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> result;
   for (auto&& [d, v] : entries_per_dir_) {
     std::scoped_lock __(v->dir_lock);
-    auto total_size = std::accumulate(
-        v->entries.begin(), v->entries.end(), 0, [](std::size_t acu, auto&& e) {
-          std::scoped_lock _(e.second->entry_lock);
-          return acu + e.second->file_size;
-        });
+    auto total_size =
+        std::accumulate(v->entries.begin(), v->entries.end(), 0ULL,
+                        [](std::size_t acu, auto&& e) {
+                          std::scoped_lock _(e.second->entry_lock);
+                          return acu + e.second->file_size;
+                        });
     result[d] = std::pair(v->entries.size(), total_size);
   }
   return result;
