@@ -147,8 +147,6 @@ ExecutionEngine::ExecutionEngine()
   if (task_concurrency_limit_) {
     FLARE_LOG_INFO("We'll serve at most {} tasks simultaneously.",
                    task_concurrency_limit_);
-    cpu_limiter_.Init();
-    cpu_limiter_->StartWithMaxCpu(task_concurrency_limit_);
   }
   waitpid_worker_ = std::thread([this] { ProcessWaiterProc(); });
   cleanup_timer_ = flare::fiber::SetTimer(flare::ReadCoarseSteadyClock(), 1s,
@@ -203,9 +201,6 @@ std::optional<std::uint64_t> ExecutionEngine::TryQueueTask(
   task->process_id = pid;
   task->task = std::move(user_task);
   task->exposition_only.command = cmd;
-
-  // The cpu limit is applied unconditionally.
-  cpu_limiter_->Limit(pid);
 
   // Wake up pid waiter.
   waitpid_semaphore_.release();
@@ -310,11 +305,8 @@ void ExecutionEngine::Stop() {
     }
   }
 
-  waitpid_semaphore_.release();  // On extra `release` to wake up our
-  // sub-process waiter (if it's sleeping.).
-  if (cpu_limiter_) {
-    cpu_limiter_->Stop();
-  }
+  waitpid_semaphore_.release();  // One extra `release` to wake up our
+                                 // sub-process waiter (if it's sleeping.).
 }
 
 void ExecutionEngine::KillTask(TaskDesc* task) {
@@ -348,9 +340,6 @@ void ExecutionEngine::Join() {
     if (!keep_sleep) {
       break;
     }
-  }
-  if (cpu_limiter_) {
-    cpu_limiter_->Join();
   }
 }
 
@@ -424,7 +413,6 @@ void ExecutionEngine::OnProcessExitCallback(pid_t pid, int exit_code) {
   // possible if the task is freed (via `FreeTask`) before its exit callback
   // fired (note that process exit callback can incur some delay).
   running_tasks_.fetch_sub(1, std::memory_order_relaxed);
-  cpu_limiter_->Remove(pid);
 
   if (!task) {
     FLARE_LOG_WARNING_EVERY_SECOND(

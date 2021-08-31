@@ -166,7 +166,6 @@ cc_library(
   hdrs = 'execution_engine.h',
   srcs = 'execution_engine.cc',
   deps = [
-    ':cpu_limiter',
     ':execute_command',
     ':execution_task',
     ':temporary_file',
@@ -259,41 +258,4 @@ cc_library(
   visibility = [
     '//yadcc/daemon:yadcc-daemon',
   ]
-)
-
-cc_library(
-  name = 'cpu_limiter',
-  hdrs = 'cpu_limiter.h',
-  srcs = 'cpu_limiter.cc',
-  deps = [
-    '//flare/base:chrono',
-    '//flare/base:logging',
-    '//flare/base:string',
-    '//flare/fiber:fiber',
-    '//flare/fiber:timer',
-    '//yadcc/daemon:sysinfo',
-  ]
-)
-
-cc_binary(
-  name = 'cpu_limiter_test_main',
-  srcs = 'cpu_limiter_test_main.cc',
-  deps = [
-    '#pthread',
-  ]
-)
-
-cc_test(
-  name = 'cpu_limiter_test',
-  srcs = 'cpu_limiter_test.cc',
-  deps = [
-    ':cpu_limiter',
-    ':cpu_limiter_test_main',
-    '//flare/base:chrono',
-    '//flare/base:logging',
-    '//flare/base:string',
-    '//flare/testing:main',
-    '//yadcc/daemon:sysinfo',
-  ],
-  exclusive = True,
 )

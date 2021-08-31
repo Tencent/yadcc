@@ -41,7 +41,6 @@
 #include "flare/base/thread/semaphore.h"
 #include "flare/fiber/latch.h"
 
-#include "yadcc/daemon/cloud/cpu_limiter.h"
 #include "yadcc/daemon/cloud/execution_task.h"
 #include "yadcc/daemon/cloud/temporary_file.h"
 
@@ -239,9 +238,6 @@ class ExecutionEngine {
   std::thread waitpid_worker_;
   // Released each timer a new subprocess is started.
   flare::CountingSemaphore<> waitpid_semaphore_{0};
-
-  // Control cpu usage of some task.
-  flare::DelayedInit<CpuLimiter> cpu_limiter_;
 
   flare::ExposedVarDynamic<Json::Value> exposed_job_internals_;
 };
