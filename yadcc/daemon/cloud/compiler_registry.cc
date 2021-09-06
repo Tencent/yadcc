@@ -57,6 +57,41 @@ std::string PathJoin(const std::string_view& x, const std::string_view& y) {
   return flare::Format("{}/{}", x, y);
 }
 
+// Test if `path` is executable by us, and if so, returns its canonical path.
+std::optional<std::string> GetCanonicalPathIfExecutable(
+    const std::string& path) {
+  struct stat st;
+  if (lstat(path.c_str(), &st) == -1) {  // 404 Not Found.
+    return std::nullopt;
+  }
+
+  char buf[PATH_MAX + 1];
+  if (!realpath(path.c_str(), buf)) {
+    return std::nullopt;
+  }
+
+  auto executable = (geteuid() == st.st_uid && (st.st_mode & S_IXUSR)) ||
+                    (getegid() == st.st_gid && (st.st_mode & S_IXGRP)) ||
+                    (st.st_mode & S_IXOTH);
+  if (!executable) {
+    return std::nullopt;
+  }
+  return buf;
+}
+
+// Compiler wrappers provided by ccache / distcc / icecc. They're not treated as
+// compiler by us.
+bool IsCompilerWrapper(const std::string& path) {
+  static const std::vector<std::string> kWrappers = {"ccache", "distcc",
+                                                     "icecc"};
+  for (auto&& e : kWrappers) {
+    if (flare::EndsWith(path, e)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<std::string> TryLookupCompilerIn(const std::string_view& dir) {
   static constexpr auto kCompilerExecutables = {
       "gcc", "g++",
@@ -65,18 +100,12 @@ std::vector<std::string> TryLookupCompilerIn(const std::string_view& dir) {
   std::vector<std::string> result;
 
   for (auto&& e : kCompilerExecutables) {
-    auto path = PathJoin(dir, e);
+    auto path = GetCanonicalPathIfExecutable(PathJoin(dir, e));
 
-    struct stat buf;
-    if (lstat(path.c_str(), &buf) == 0) {  // File exists.
-      if (S_ISLNK(buf.st_mode)) {          // Symbolic link, ignore it.
-        continue;
-      }
-      if ((geteuid() == buf.st_uid && (buf.st_mode & S_IXUSR)) ||
-          (buf.st_mode & S_IXOTH)) {  // Executable.
-        result.push_back(path);
-      }
+    if (!path || IsCompilerWrapper(*path)) {
+      continue;
     }
+    result.push_back(*path);
   }
   return result;
 }

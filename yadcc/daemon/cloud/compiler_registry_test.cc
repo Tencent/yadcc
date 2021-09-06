@@ -14,28 +14,57 @@
 
 #include "yadcc/daemon/cloud/compiler_registry.h"
 
+#include "thirdparty/gflags/gflags.h"
 #include "thirdparty/googletest/gtest/gtest.h"
+
+#include "flare/base/string.h"
+
+DECLARE_string(extra_compiler_dirs);
 
 namespace yadcc::daemon::cloud {
 
-// BLAKE3 of `testdata/gcc`.
-constexpr auto kTestCompilerDigest =
-    "a609c75b33a74f24e3bdf474d206cb486e0ea2b353e87886e849b505678d4ea7";
+// BLAKE3 of `native-gcc/gcc`.
+constexpr auto kNativeGccDigest =
+    "ed756eba1ad5a11b557851c99e9d900f21a0d4e32f590a950019f132569bc834";
+// `symlink-gcc/gcc`
+constexpr auto kSymlinkGccDigest =
+    "31eabbe1a118bd886aa87dda7139b2beb1e5fdec06bdf2686be9ed9dfe0ed65f";
+// `symlink-ccache/gcc`
+constexpr auto kSymlinkCcacheDigest =
+    "913cefa83a568d15f15d84d715e449a002364a9c6079fb46a56d1381cfb773f5";
 
 TEST(CompilerRegistry, All) {
-  CompilerRegistry::Instance()->RegisterEnvironment("./test-bin/gcc");
+  FLAGS_extra_compiler_dirs =
+      "test-bin/native-gcc/:"
+      "test-bin/symlink-ccache/:"
+      "test-bin/symlink-gcc/:"
+      "test-bin/symlink-to-404/";
+
+  // blade does not handle symlinks in `testdata` well, so we generate the
+  // symlinks ourselves.
+  symlink("./ccache", "test-bin/symlink-ccache/gcc");
+  symlink("./gcc-9", "test-bin/symlink-gcc/gcc");
+  symlink("./404", "test-bin/symlink-to-404/gcc");
 
   auto envs = CompilerRegistry::Instance()->EnumerateEnvironments();
-  EXPECT_GE(envs.size(), 1);
+  EXPECT_GE(envs.size(), 2);
 
   EXPECT_NE(envs.end(), std::find_if(envs.begin(), envs.end(), [&](auto&& e) {
-              return e.compiler_digest() == kTestCompilerDigest;
+              return e.compiler_digest() == kNativeGccDigest;
             }));
 
   EnvironmentDesc desc;
 
-  desc.set_compiler_digest(kTestCompilerDigest);
-  EXPECT_EQ("./test-bin/gcc",
+  desc.set_compiler_digest(kNativeGccDigest);
+  EXPECT_TRUE(
+      flare::EndsWith(*CompilerRegistry::Instance()->TryGetCompilerPath(desc),
+                      "test-bin/native-gcc/gcc"));
+  desc.set_compiler_digest(kSymlinkGccDigest);
+  EXPECT_TRUE(
+      flare::EndsWith(*CompilerRegistry::Instance()->TryGetCompilerPath(desc),
+                      "test-bin/symlink-gcc/gcc-9"));
+  desc.set_compiler_digest(kSymlinkCcacheDigest);
+  EXPECT_EQ(std::nullopt,
             CompilerRegistry::Instance()->TryGetCompilerPath(desc));
 
   desc.set_compiler_digest("something won't be there");
