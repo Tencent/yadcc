@@ -90,6 +90,8 @@ cc_test(
   deps = [
     ':compiler_registry',
     '//flare/base:chrono',
+    '//flare/base:logging',
+    '//flare/base:string',
     '//flare/fiber:fiber',
     '//flare/init:override_flag',
     '//flare/testing:main',
