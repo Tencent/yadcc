@@ -54,6 +54,7 @@ cc_test(
   srcs = 'compiler_registry_test.cc',
   deps = [
     ':compiler_registry',
+    '//flare/base:logging',
     '//flare/base:string',
     '//thirdparty/gflags:gflags',
   ],
