@@ -42,9 +42,9 @@ TEST(CompilerRegistry, All) {
 
   // blade does not handle symlinks in `testdata` well, so we generate the
   // symlinks ourselves.
-  symlink("./ccache", "test-bin/symlink-ccache/gcc");
-  symlink("./gcc-9", "test-bin/symlink-gcc/gcc");
-  symlink("./404", "test-bin/symlink-to-404/gcc");
+  (void)symlink("./ccache", "test-bin/symlink-ccache/gcc");
+  (void)symlink("./gcc-9", "test-bin/symlink-gcc/gcc");
+  (void)symlink("./404", "test-bin/symlink-to-404/gcc");
 
   auto envs = CompilerRegistry::Instance()->EnumerateEnvironments();
   EXPECT_GE(envs.size(), 2);
