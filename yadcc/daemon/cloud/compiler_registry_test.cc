@@ -17,6 +17,7 @@
 #include "thirdparty/gflags/gflags.h"
 #include "thirdparty/googletest/gtest/gtest.h"
 
+#include "flare/base/logging.h"
 #include "flare/base/string.h"
 
 DECLARE_string(extra_compiler_dirs);
@@ -42,9 +43,9 @@ TEST(CompilerRegistry, All) {
 
   // blade does not handle symlinks in `testdata` well, so we generate the
   // symlinks ourselves.
-  (void)symlink("./ccache", "test-bin/symlink-ccache/gcc");
-  (void)symlink("./gcc-9", "test-bin/symlink-gcc/gcc");
-  (void)symlink("./404", "test-bin/symlink-to-404/gcc");
+  FLARE_PCHECK(symlink("./ccache", "test-bin/symlink-ccache/gcc") == 0);
+  FLARE_PCHECK(symlink("./gcc-9", "test-bin/symlink-gcc/gcc") == 0);
+  FLARE_PCHECK(symlink("./404", "test-bin/symlink-to-404/gcc") == 0);
 
   auto envs = CompilerRegistry::Instance()->EnumerateEnvironments();
   EXPECT_GE(envs.size(), 2);
