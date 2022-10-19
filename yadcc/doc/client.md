@@ -10,7 +10,7 @@
 
 此处主要列出适用于所有客户端的配置参数。
 
-*部分工具链（如[Bazel](https://bazel.build/designs/2016/06/21/environment.html#current-shortcomings)）会在调用编译器之前“重置”环境变量。此时需要用户自行采取工具链特有的方式传递如下配置项给`yadcc`。*
+*部分工具链（如[Bazel](https://bazel.build/)）会在调用编译器之前“重置”环境变量。此时需要用户自行采取工具链特有的方式传递如下配置项给`yadcc`。*
 
 - `YADCC_WARN_ON_WAIT_LONGER_THAN`：整数类型。如果在等待了这么多秒之后本地守护进程依然没有授予wrapper开始执行命令的权力，会输出一条warning级别日志。
 
