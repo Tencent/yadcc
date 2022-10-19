@@ -22,10 +22,18 @@ cc_library(
   visibility = '//yadcc/client/...',
 )
 
-resource_library(
+# Serializes `libfakeroot.so` into `libfakeroot.h`, so that we can later embed
+# that shared library into `yadcc-client`.
+#
+# Ideally we should store `libfakeroot.so` in `libfakeroot.c` and only leave a
+# declaration (but not a definition) in header. However, since we only include
+# it once, for the sake of rule's simplicity, we store everything in header.
+gen_rule(
   name = 'libfakeroot',
-  srcs = [
-    'libfakeroot.so',
+  outs = 'libfakeroot.h',
+  cmd = 'cd $BUILD_DIR && xxd -i $SRC_DIR/libfakeroot.so ../$FIRST_OUT',
+  deps = [
+    ':fakeroot'
   ],
   visibility = '//yadcc/client/...',
 )

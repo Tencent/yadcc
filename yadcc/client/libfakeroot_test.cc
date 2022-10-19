@@ -38,9 +38,9 @@ TEST(LibFakeRoot, ConcurrentExtraction) {
     e = std::thread([&] {
       while (!done) {
         ExtractLibFakeRootTo("./libfakeroot.so");
-        ASSERT_EQ(std::string_view(
-                      RESOURCE_yadcc_client_libfakeroot_libfakeroot_so,
-                      RESOURCE_yadcc_client_libfakeroot_libfakeroot_so_len),
+        ASSERT_EQ(std::string_view(reinterpret_cast<const char*>(
+                                       yadcc_client_libfakeroot_libfakeroot_so),
+                                   yadcc_client_libfakeroot_libfakeroot_so_len),
                   ReadAll("./libfakeroot.so"));
       }
     });
