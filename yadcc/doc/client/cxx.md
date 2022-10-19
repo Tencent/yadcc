@@ -69,7 +69,7 @@
 
   - 压缩：我们使用时空表现出色的[zstd](https://github.com/facebook/zstd)算法。相对于传统选择LZO，zstd允许我们将更多的时间交给GCC作预处理。
 
-  注：与我们一样，[ccache 4.0](https://ccache.dev/releasenotes.html#_ccache_4_0)开始也选择切换至blake3 + zstd + xxhash。（xxhash我们主要在[本地守护进程](daemon.md)管理缓存布隆过滤器使用。）
+  注：与我们一样，[ccache 4.0](https://ccache.dev/releasenotes.html#_ccache_4_0)开始也选择切换至blake3 + zstd + xxhash。（xxhash我们主要在[本地守护进程](../daemon.md)管理缓存布隆过滤器使用。）
 
 ## 其他
 
