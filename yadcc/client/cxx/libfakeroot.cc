@@ -32,8 +32,8 @@ namespace yadcc::client {
 namespace {
 
 const std::string_view kLibFakeRootPayload(
-    RESOURCE_yadcc_client_cxx_libfakeroot_libfakeroot_so,
-    RESOURCE_yadcc_client_cxx_libfakeroot_libfakeroot_so_len);
+    reinterpret_cast<const char*>(yadcc_client_cxx_libfakeroot_libfakeroot_so),
+    yadcc_client_cxx_libfakeroot_libfakeroot_so_len);
 
 // Well, it actually user's home directory.
 const std::string kWayToHome = [] {
