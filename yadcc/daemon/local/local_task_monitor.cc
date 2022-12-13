@@ -220,7 +220,7 @@ Json::Value LocalTaskMonitor::DumpInternals() {
       static_cast<Json::UInt64>(lightweight_task_overprovisioning_);
 
   for (auto&& e : permissions_granted_) {
-    jsv["running_tasks"].append(static_cast<Json::UInt64>(e));
+    jsv["tasks"].append(static_cast<Json::UInt64>(e));
   }
 
   return jsv;

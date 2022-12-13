@@ -45,7 +45,7 @@
 3. 创建软链接`~/.yadcc/symlinks/{c++,g++,gcc}`至`~/.yadcc/bin/yadcc`。
 4. 将`~/.yadcc/symlinks`加入`PATH`的头部。
 
-执行完毕上述操作之后`which gcc`应当输出类似于`~/.yadcc/bin/yadcc`的结果。
+执行完毕上述操作之后`which gcc`应当输出类似于`~/.yadcc/symlinks/gcc`的结果。
 
 **请注意，创建软链并通过软链`~/.yadcc/symlinks/g++`执行并不等同于直接执行`~/.yadcc/bin/yadcc`**。这两种方式下`yadcc`收到的`argv[0]`不同。当`yadcc`检测到`argv[0]`是`gcc`或`g++`时，有特殊逻辑来使得`yadcc`的行为“看起来像”一个真实的GCC编译器。这也是实现“drop-in replacement”的基础。
 
