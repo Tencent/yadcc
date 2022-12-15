@@ -14,6 +14,8 @@
 
 syntax = "proto3";
 
+import "google/protobuf/any.proto";
+
 import "yadcc/api/env_desc.proto";
 
 package yadcc.daemon.cloud;
@@ -27,12 +29,9 @@ package yadcc.daemon.cloud;
 // client acts as a compiler wrapper, and thus, it's extremely sensitive to
 // start-up time.
 //
-// Therefore, our client is written specifically in a way that avoids
-// introducing too many dependencies, and simply uses libcurl to queue
-// compilation tasks for distribution via HTTP.
-//
-// @sa: `daemon/local/README.md` if you're interested in interfaces provided to
-// the client.
+// Therefore, our client is written specifically in a way that's simple enough
+// to interact with. @sa: `daemon/local/README.md` if you're interested in
+// interfaces provided to the client.
 
 //////////////////////////////////////////////////////////
 // Everything below is exchanged between daemons only.  //
@@ -54,6 +53,15 @@ enum Status {
 
   // Token invalid?
   STATUS_ACCESS_DENIED = 1003;
+
+  // No task found.
+  STATUS_TASK_NOT_FOUND = 1004;
+
+  // Invalid argument.
+  STATUS_INVALID_ARGUMENT = 1005;
+
+  // Failed to access yadcc-fs.
+  STATUS_DISTRIBUTED_FILE_SYSTEM_IO = 1006;
 }
 
 enum CompressionAlgorithm {
@@ -82,11 +90,11 @@ enum CompilationTaskStatus {
   COMPILATION_TASK_STATUS_NOT_FOUND = 4;
 };
 
-message QueueCompilationTaskRequest {
-  string token = 6;  // Obtained from `scheduler.GetConfig`.
+message QueueCxxCompilationTaskRequest {
+  string token = 1;  // Obtained from `scheduler.GetConfig`.
 
   // Grant for running this task. This ID is allocated by the scheduler.
-  uint64 task_grant_id = 3;
+  uint64 task_grant_id = 2;
 
   // TODO(luobogao): We need a signature from the scheduler to test its
   // validity. The scheduler can provide its public key in heartbeat response.
@@ -103,30 +111,36 @@ message QueueCompilationTaskRequest {
   // bytes scheduler_signature = 6;
 
   // Desired compilation environment.
-  EnvironmentDesc env_desc = 1;
+  EnvironmentDesc env_desc = 3;
 
   // Path of the source to be compiled.
-  string source_path = 5;
+  string source_path = 4;
 
   // Neither `gcc` nor `g++` would appear here. Given that `-x XXX` (i.e.,
   // source language) is provided, whether we'll be calling `gcc` or `g++` is
   // not significant.
-  string invocation_arguments = 2;
+  string invocation_arguments = 5;
 
   // Algorithm for compressing the preprocessed source code.
-  uint32 compression_algorithm = 4;  // @sa: CompressionAlgorithm
+  uint32 compression_algorithm = 6;  // @sa: CompressionAlgorithm
 
-  // If set, we won't fill the cache on completion. (TODO(luobogao): Not
-  // implemented yet.)
+  // If set, we won't fill the cache on completion.
   bool disallow_cache_fill = 7;
 
   // See attchment for preprocessed source code.
 }
 
-message QueueCompilationTaskResponse {
+message QueueCxxCompilationTaskResponse {
   uint64 task_id = 1;
-  uint32 status = 2;  // Hard coded to `COMPILATION_TASK_STATUS_RUNNING`.
 }
+
+message ReferenceTaskRequest {
+  string token = 2;  // Obtained from `scheduler.GetConfig`.
+
+  uint64 task_id = 1;
+}
+
+message ReferenceTaskResponse {}
 
 message WaitForCompilationOutputRequest {
   string token = 4;  // Obtained from `scheduler.GetConfig`.
@@ -134,6 +148,7 @@ message WaitForCompilationOutputRequest {
   uint64 task_id = 1;
   uint32 milliseconds_to_wait = 2;  // Up to 10s.
   repeated uint32 acceptable_compression_algorithms = 3 [packed = true];
+  uint32 version = 5;
 }
 
 message WaitForCompilationOutputResponse {
@@ -152,13 +167,16 @@ message WaitForCompilationOutputResponse {
   bytes output = 5;
   bytes error = 3;
 
-  // Algorithm for compressing the object file (compilation result).
-  //
-  // TODO(luobogao): Not implemented yet. As I observes it, compressing the
-  // result should be profitable, just as compressing preprocessed source code.
-  uint32 compression_algorithm = 4;  // @sa: CompressionAlgorithm Always `NONE`.
+  // Language-specific information, @sa: `XxxCompilationInfo`.
+  google.protobuf.Any extra_info = 7;
 
-  // Compilation output is attached as attachment.
+  // Algorithm for compressing the object file (compilation result).
+  uint32 compression_algorithm = 4;
+
+  // Compilation output is attached as attachment, using packed KV buffers.
+  //
+  // For C/C++ tasks, keys are file extensions (e.g., `.o`, `.gcno`).
+  // For Java tasks, keys are relative paths (e.g., `pkg/to/Class.class`).
 }
 
 message FreeTaskRequest {
@@ -172,24 +190,27 @@ message FreeTaskResponse {
 }
 
 service DaemonService {
-  // Queue a compilation task.
+  // Queue a C/C++ compilation task.
   //
   // The execution of this task might be delayed if the daemon is suffering from
   // a temporarily overload. In case there are already too many tasks queued,
   // this method may reject further tasks actively.
-  //
-  // Depending on how long the compilation takes, this method may return before
-  // the compilation actually completes (always the case at the moment). If this
-  // is the case, you can use `WaitForCompilationOutput` to get the compilation
-  // output later.
-  rpc QueueCompilationTask(QueueCompilationTaskRequest)
-      returns (QueueCompilationTaskResponse);
+  rpc QueueCxxCompilationTask(QueueCxxCompilationTaskRequest)
+      returns (QueueCxxCompilationTaskResponse);
 
-  // For compilation task that takes a long time, `QueueCompilationTask` can
-  // complete before compilation itself completes. This is required to avoid RPC
-  // timeout.
+  // Indicate to some client wait for the task.
   //
-  // In this case, task ID returned by `QueueCompilationTask` can be used to
+  // If compilation task is already submited on cluster, we should attach this
+  // task and add task reference count. Now that if the compilation task comlete
+  // on other workflow，the compilation result won't be cleaned utill all the
+  // client dereference it.
+  rpc ReferenceTask(ReferenceTaskRequest) returns (ReferenceTaskResponse);
+
+  // For compilation task that takes a long time, it would be impossible to
+  // return the compilation result from `QueueXxxCompilationTask`. This is
+  // required to avoid RPC timeout.
+  //
+  // In this case, task ID returned by `QueueXxxCompilationTask` can be used to
   // query compilation result (in long-polling fashion) until the compilation
   // itself actually completes.
   //

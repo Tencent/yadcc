@@ -19,6 +19,11 @@
 #include <string>
 #include <unordered_set>
 
+#include "gflags/gflags_declare.h"
+
+DECLARE_string(acceptable_user_tokens);
+DECLARE_string(acceptable_servant_tokens);
+
 namespace yadcc {
 
 // This class helps us to verify user's token.
@@ -43,10 +48,11 @@ class TokenVerifier {
   std::unordered_set<std::string> recognized_tokens_;
 };
 
-// Make a `TokenVerifier` accepting token listed in flag `acceptable_tokens`.
+// Make a `TokenVerifier` accepting token listed in `flags`.
 //
 // Returning `std::unique_ptr` (instead of an object) for coding simplicity.
-std::unique_ptr<TokenVerifier> MakeTokenVerifierFromFlag();
+std::unique_ptr<TokenVerifier> MakeTokenVerifierFromFlag(
+    const std::string& flags);
 
 }  // namespace yadcc
 

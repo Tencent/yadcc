@@ -14,14 +14,14 @@
 
 #include "yadcc/daemon/cloud/distributed_cache_writer.h"
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 #include "flare/fiber/future.h"
 #include "flare/init/override_flag.h"
 #include "flare/testing/main.h"
 #include "flare/testing/rpc_mock.h"
 
-#include "yadcc/api/cache.flare.pb.h"
+#include "yadcc/api/cache.pb.h"
 
 FLARE_OVERRIDE_FLAG(cache_server_uri, "mock://what-ever-it-wants-to-be");
 
@@ -45,8 +45,11 @@ TEST(DistributedCacheWriter, Success) {
 
   EXPECT_TRUE(
       flare::fiber::BlockingGet(DistributedCacheWriter::Instance()->AsyncWrite(
-          "my cache key", 0, "output", "error",
-          flare::CreateBufferSlow("object file"))));
+          "my cache key", CacheEntry{0,
+                                     "output",
+                                     "error",
+                                     {},
+                                     flare::CreateBufferSlow("object file")})));
 }
 
 TEST(DistributedCacheWriter, Failure) {
@@ -55,7 +58,8 @@ TEST(DistributedCacheWriter, Failure) {
 
   EXPECT_FALSE(
       flare::fiber::BlockingGet(DistributedCacheWriter::Instance()->AsyncWrite(
-          "my cache key", 0, {}, {}, flare::CreateBufferSlow("object file"))));
+          "my cache key",
+          CacheEntry{0, {}, {}, {}, flare::CreateBufferSlow("object file")})));
 }
 
 }  // namespace yadcc::daemon::cloud

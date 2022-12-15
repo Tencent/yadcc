@@ -16,12 +16,13 @@
 #define YADCC_DAEMON_CLOUD_COMPILER_REGISTRY_H_
 
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include "thirdparty/googletest/gtest/gtest_prod.h"
+#include "gtest/gtest_prod.h"
 
 #include "yadcc/api/env_desc.pb.h"
 
@@ -46,22 +47,29 @@ class CompilerRegistry {
   std::optional<std::string> TryGetCompilerPath(
       const EnvironmentDesc& env) const;
 
+  void Stop();
+  void Join();
+
  private:
   FRIEND_TEST(CompilerRegistry, All);
+  FRIEND_TEST(CompilerRegistry, Delete);
+  FRIEND_TEST(CompilerRegistry, Stability);
 
-  // Converts `desc` to a string that can be used to look compiler info in our
-  // internal map.
-  static std::string GetEnvironmentString(const EnvironmentDesc& desc);
+  void OnCompilerRescanTimer();
 
-  // Register a compilation environment.
-  void RegisterEnvironment(const std::string_view& path);
+  void UpdateEnvironment(
+      const std::unordered_map<std::string, std::string>& temp_paths,
+      const std::vector<EnvironmentDesc>& temp_envs);
 
  private:
-  // Not locked. This mapping is initialized on start-up.
+  mutable std::shared_mutex mutex_;
+
   std::unordered_map<std::string, std::string> compiler_paths_;
 
   // Registered compilation environments.
   std::vector<EnvironmentDesc> environments_;
+
+  std::uint64_t compiler_scanner_timer_;
 };
 
 }  // namespace yadcc::daemon::cloud

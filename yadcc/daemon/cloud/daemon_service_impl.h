@@ -15,16 +15,15 @@
 #ifndef YADCC_DAEMON_CLOUD_DAEMON_SERVICE_IMPL_H_
 #define YADCC_DAEMON_CLOUD_DAEMON_SERVICE_IMPL_H_
 
-#include <mutex>
+#include <chrono>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
-#include <vector>
 
 #include "yadcc/api/daemon.flare.pb.h"
 #include "yadcc/common/token_verifier.h"
 #include "yadcc/daemon/cloud/execution_engine.h"
-#include "yadcc/daemon/cloud/sysinfo.h"
 
 namespace yadcc::daemon::cloud {
 
@@ -33,11 +32,14 @@ class DaemonServiceImpl : public SyncDaemonService {
  public:
   // IP:port to access us should be provided in `network_location`.
   explicit DaemonServiceImpl(std::string network_location);
-  ~DaemonServiceImpl();
 
-  void QueueCompilationTask(const QueueCompilationTaskRequest& request,
-                            QueueCompilationTaskResponse* response,
-                            flare::RpcServerController* controller) override;
+  void QueueCxxCompilationTask(const QueueCxxCompilationTaskRequest& request,
+                               QueueCxxCompilationTaskResponse* response,
+                               flare::RpcServerController* controller) override;
+
+  void ReferenceTask(const ReferenceTaskRequest& request,
+                     ReferenceTaskResponse* response,
+                     flare::RpcServerController* controller) override;
 
   void WaitForCompilationOutput(
       const WaitForCompilationOutputRequest& request,

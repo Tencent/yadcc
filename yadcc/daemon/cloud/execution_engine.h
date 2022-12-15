@@ -29,16 +29,19 @@
 #include <unordered_set>
 #include <vector>
 
-#include "thirdparty/googletest/gtest/gtest_prod.h"
-#include "thirdparty/jsoncpp/json.h"
+#include "gtest/gtest_prod.h"
+#include "jsoncpp/json.h"
 
 #include "flare/base/buffer.h"
+#include "flare/base/delayed_init.h"
 #include "flare/base/expected.h"
 #include "flare/base/exposed_var.h"
+#include "flare/base/function.h"
 #include "flare/base/ref_ptr.h"
 #include "flare/base/thread/semaphore.h"
 #include "flare/fiber/latch.h"
 
+#include "yadcc/daemon/cloud/execution_task.h"
 #include "yadcc/daemon/cloud/temporary_file.h"
 
 namespace yadcc::daemon::cloud {
@@ -49,11 +52,12 @@ enum class ExecutionStatus {
   NotFound  // Expired?
 };
 
+// @sa: `api/scheduler.proto`.
 enum class NotAcceptingTaskReason {
   Unknown,
   UserInstructed,  // Not used, really.
   PoorMachine,
-  CGroupsPresent
+  CGroupsPresent,
 };
 
 // Compilation jobs are run inside here.
@@ -88,6 +92,12 @@ class ExecutionEngine {
     std::shared_ptr<void> context;
   };
 
+  struct Task {
+    std::uint64_t servant_task_id;
+    std::uint64_t task_grant_id;
+    flare::RefPtr<ExecutionTask> task;
+  };
+
   static ExecutionEngine* Instance();
 
   ExecutionEngine();
@@ -97,12 +107,15 @@ class ExecutionEngine {
   // In case the daemon is not ready for accepting tasks, a reason is returned.
   flare::Expected<std::size_t, NotAcceptingTaskReason> GetMaximumTasks() const;
 
-  // Queue a command to be executed. If there's already too many jobs to
-  // execute, a failure is returned.
-  std::optional<std::uint64_t> TryQueueCommandForExecution(
-      std::uint64_t grant_id, const std::string& command, Input input);
+  // Queue a task for execution. If there's already too many tasks running, a
+  // failure is returned.
+  std::optional<std::uint64_t> TryQueueTask(
+      std::uint64_t grant_id, flare::RefPtr<ExecutionTask> user_task);
 
-  // Wait for job to complete.
+  // Reference existed task from daemons.
+  bool TryReferenceTask(std::uint64_t task_id);
+
+  // Wait for task to complete.
   //
   // `ExecutionStatus::Failed` is returned if we failed to run the command.
   //
@@ -111,14 +124,14 @@ class ExecutionEngine {
   // a later time.
   //
   // `ExecutionStatus::NotFound` is returned if the task ID is not known to us.
-  flare::Expected<Output, ExecutionStatus> WaitForCompletion(
+  flare::Expected<flare::RefPtr<ExecutionTask>, ExecutionStatus> WaitForTask(
       std::uint64_t task_id, std::chrono::nanoseconds timeout);
 
   // Forget about the given task. All resources allocated to it is freed.
   void FreeTask(std::uint64_t task_id);
 
-  // Returns a list of grant of running tasks.
-  std::vector<std::uint64_t> EnumerateGrantOfRunningTask();
+  // Enumerate all tasks.
+  std::vector<Task> EnumerateTasks() const;
 
   // Forcibly kill all tasks whose grant ID is not in the given list.
   //
@@ -134,25 +147,11 @@ class ExecutionEngine {
   void Join();
 
  private:
-  FRIEND_TEST(ExecutionEngine, All);
-  FRIEND_TEST(ExecutionEngine, Stability);
-  FRIEND_TEST(ExecutionEngine, RejectOnMemoryFull);
-
-  // Forcibly kill a running task.
-  //
-  // Note that this method does NOT remove the task's context. Task's context is
-  // either freed by a later call to `FreeTask`, or our cleanup timer.
-  void KillTask(std::uint64_t task_id);
-
-  void OnCleanupTimer();
-  void OnProcessExitCallback(pid_t pid, int exit_code);  // In Fiber env.
-  void ProcessWaiterProc();
-
-  Json::Value DumpTasks();
-
- private:
   struct TaskDesc : flare::RefCounted<TaskDesc> {
     std::uint64_t grant_id;
+
+    // The count of client which wait for the task;
+    std::uint32_t client_ref_count;
 
     // Set if the task is still running. Cleared by `OnProcessExitCallback`.
     std::atomic<bool> is_running{true};
@@ -169,21 +168,54 @@ class ExecutionEngine {
     // kill it and all its
     pid_t process_id;
 
-    // Command being executed.
-    std::string command;
+    // References user's task.
+    flare::RefPtr<ExecutionTask> task;
 
-    // Input to this task. Automatically cleared on command completion to free
-    // resources ASAP.
-    std::optional<Input> input;
+    // Holds temporary file for stdout / stderr.
+    std::optional<TemporaryFile> stdout_file, stderr_file;
 
-    // If the task has completed, the result is stored here.
-    Output output;
+    // Java task will set this true.
+    bool limit_cpu;
 
     // Always signaled by `OnProcessExitCallback`, even if the task is killed by
     // `KillTask`.
     flare::fiber::Latch completion_latch{1};
+
+    // Fields below are for exposition purpose only (via `DumpInternals()`).
+    struct {
+      // Command line we run.
+      std::string command;
+
+      // Exit code of the command (available after the command completes).
+      int exit_code;
+
+      // Byte size of stdout / stderr (available after the command completes).
+      std::size_t stdout_size, stderr_size;
+    } exposition_only;
   };
 
+ private:
+  FRIEND_TEST(ExecutionEngine, Basic);
+  FRIEND_TEST(ExecutionEngine, Task);
+  FRIEND_TEST(ExecutionEngine, Stability);
+  FRIEND_TEST(ExecutionEngine, RejectOnMemoryFull);
+
+  // Validate if we can start a new task, and allocation a task ID we can.
+  std::optional<std::uint64_t> TryStartingNewTaskUnsafe();
+
+  // Forcibly kill a running task.
+  //
+  // Note that this method does NOT remove the task's context. Task's context is
+  // either freed by a later call to `FreeTask`, or our cleanup timer.
+  void KillTask(TaskDesc* task);
+
+  void OnCleanupTimer();
+  void OnProcessExitCallback(pid_t pid, int exit_code);  // In Fiber env.
+  void ProcessWaiterProc();
+
+  Json::Value DumpTasks();
+
+ private:
   std::atomic<bool> exiting_{false};
 
   std::size_t task_concurrency_limit_;
@@ -198,7 +230,7 @@ class ExecutionEngine {
 
   // Task IDs are allocated by it.
   std::atomic<std::uint64_t> next_task_id_{1};
-  flare::fiber::Mutex tasks_lock_;
+  mutable flare::fiber::Mutex tasks_lock_;
   // Task referenced by this map is either running or waiting to be read by
   // remote daemon.
   std::unordered_map<std::uint64_t, flare::RefPtr<TaskDesc>> tasks_;

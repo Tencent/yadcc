@@ -17,6 +17,8 @@ cc_library(
   hdrs = 'task_dispatcher.h',
   srcs = 'task_dispatcher.cc',
   deps = [
+    ':running_task_bookkeeper',
+    '//flare/base:expected',
     '//flare/base:exposed_var',
     '//flare/base:logging',
     '//flare/base:never_destroyed',
@@ -28,6 +30,7 @@ cc_library(
     '//thirdparty/jsoncpp:jsoncpp',
     '//yadcc/api:env_desc_proto',
     '//yadcc/api:scheduler_proto_flare',
+    '//yadcc/api:scheduler_proto',
     '//yadcc/common:parse_size',
   ]
 )
@@ -68,8 +71,28 @@ cc_test(
     '//flare/rpc:rpc',
     '//flare/testing:main',
     '//flare/testing:rpc_controller',
+    '//yadcc/scheduler:task_dispatcher',
   ]
 )
+
+cc_library(
+  name = 'running_task_bookkeeper',
+  hdrs = 'running_task_bookkeeper.h',
+  srcs = 'running_task_bookkeeper.cc',
+  deps = [
+    '//yadcc/api:scheduler_proto',
+  ]
+)
+
+cc_test(
+  name = 'running_task_bookkeeper_test',
+  srcs = 'running_task_bookkeeper_test.cc',
+  deps = [
+    ':running_task_bookkeeper',
+    '//thirdparty/googletest:gmock',
+  ]
+)
+
 
 cc_binary(
   name = 'yadcc-scheduler',

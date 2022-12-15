@@ -46,11 +46,16 @@ class SchedulerServiceImpl : public SyncSchedulerService {
   void FreeTask(const FreeTaskRequest& request, FreeTaskResponse* response,
                 flare::RpcServerController* controller) override;
 
+  void GetRunningTasks(const GetRunningTasksRequest& request,
+                       GetRunningTasksResponse* response,
+                       flare::RpcServerController* controller) override;
+
  private:
   std::vector<std::string> DetermineActiveServingDaemonTokens();
 
  private:
-  std::unique_ptr<TokenVerifier> token_verifier_ = MakeTokenVerifierFromFlag();
+  std::unique_ptr<TokenVerifier> is_user_verifier_;
+  std::unique_ptr<TokenVerifier> is_servant_verifier_;
 
   std::mutex lock_;
   std::chrono::steady_clock::time_point next_serving_daemon_token_rollout_{};

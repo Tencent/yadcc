@@ -14,8 +14,8 @@
 
 #include "yadcc/daemon/local/distributed_cache_reader.h"
 
-#include "thirdparty/googletest/gtest/gtest.h"
-#include "thirdparty/xxhash/xxhash.h"
+#include "gtest/gtest.h"
+#include "xxhash/xxhash.h"
 
 #include "flare/base/compression.h"
 #include "flare/base/experimental/bloom_filter.h"
@@ -66,11 +66,11 @@ void HandleFetchBloomFilter(const cache::FetchBloomFilterRequest& req,
 void HandleTryGetEntry(const cache::TryGetEntryRequest& request,
                        cache::TryGetEntryResponse* response,
                        flare::RpcServerController* controller) {
-  controller->SetResponseAttachment(WriteCacheEntry(
-      CacheEntry{.exit_code = 123,
-                 .standard_output = "output",
-                 .standard_error = "err",
-                 .object_file = flare::CreateBufferSlow("obj")}));
+  controller->SetResponseAttachment(
+      WriteCacheEntry(CacheEntry{.exit_code = 123,
+                                 .standard_output = "output",
+                                 .standard_error = "err",
+                                 .files = flare::CreateBufferSlow("obj")}));
 }
 
 }  // namespace
@@ -87,7 +87,7 @@ TEST(DistributedCacheReader, Success) {
   EXPECT_EQ(123, result->exit_code);
   EXPECT_EQ("output", result->standard_output);
   EXPECT_EQ("err", result->standard_error);
-  EXPECT_EQ("obj", flare::FlattenSlow(result->object_file));
+  EXPECT_EQ("obj", flare::FlattenSlow(result->files));
 
   // Called before incremental bloom filter update happens.
   result = DistributedCacheReader::Instance()->TryRead("my cache key4");

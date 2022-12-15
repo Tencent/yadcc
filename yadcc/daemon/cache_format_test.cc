@@ -14,7 +14,7 @@
 
 #include "yadcc/daemon/cache_format.h"
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 namespace yadcc::daemon {
 
@@ -23,7 +23,7 @@ TEST(CacheFormat, All) {
       .exit_code = 1,
       .standard_output = "output",
       .standard_error = "error",
-      .object_file = flare::CreateBufferSlow(std::string(123456, 'a'))};
+      .files = flare::CreateBufferSlow(std::string(123456, 'a'))};
 
   auto bytes = WriteCacheEntry(result);
   ASSERT_FALSE(bytes.Empty());
@@ -37,12 +37,11 @@ TEST(CacheFormat, All) {
 
   // Not using `EXPECT_EQ` because on failure `EXPECT_EQ` would print a huge
   // amount of diagnostics.
-  EXPECT_TRUE(std::string(123456, 'a') ==
-              flare::FlattenSlow(parsed->object_file));
+  EXPECT_TRUE(std::string(123456, 'a') == flare::FlattenSlow(parsed->files));
 }
 
 TEST(CacheFormat, Corrupted) {
-  CacheEntry result = {.object_file =
+  CacheEntry result = {.files =
                            flare::CreateBufferSlow(std::string(123456, 'a'))};
 
   auto bytes = WriteCacheEntry(result);
@@ -57,7 +56,7 @@ TEST(CacheFormat, Corrupted) {
 }
 
 TEST(CacheFormat, Corrupted2) {
-  CacheEntry result = {.object_file =
+  CacheEntry result = {.files =
                            flare::CreateBufferSlow(std::string(123456, 'a'))};
 
   auto bytes = WriteCacheEntry(result);
@@ -71,7 +70,7 @@ TEST(CacheFormat, Corrupted2) {
 }
 
 TEST(CacheFormat, Corrupted3) {
-  CacheEntry result = {.object_file =
+  CacheEntry result = {.files =
                            flare::CreateBufferSlow(std::string(123456, 'a'))};
   auto bytes = WriteCacheEntry(result);
   ASSERT_FALSE(bytes.Empty());

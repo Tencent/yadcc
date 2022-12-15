@@ -25,7 +25,7 @@
 #include <chrono>
 #include <memory>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/string.h"
 #include "flare/fiber/this_fiber.h"
@@ -34,18 +34,20 @@
 #include "flare/rpc/server.h"
 #include "flare/rpc/server_group.h"
 
+#include "yadcc/common/dir.h"
 #include "yadcc/common/inspect_auth.h"
 #include "yadcc/daemon/cloud/compiler_registry.h"
 #include "yadcc/daemon/cloud/daemon_service_impl.h"
 #include "yadcc/daemon/cloud/distributed_cache_writer.h"
 #include "yadcc/daemon/cloud/execution_engine.h"
-#include "yadcc/daemon/cloud/sysinfo.h"
 #include "yadcc/daemon/common_flags.h"
 #include "yadcc/daemon/local/distributed_cache_reader.h"
 #include "yadcc/daemon/local/distributed_task_dispatcher.h"
 #include "yadcc/daemon/local/http_service_impl.h"
 #include "yadcc/daemon/local/local_task_monitor.h"
 #include "yadcc/daemon/privilege.h"
+#include "yadcc/daemon/sysinfo.h"
+#include "yadcc/daemon/temp_dir.h"
 
 using namespace std::literals;
 
@@ -79,8 +81,9 @@ DEFINE_bool(allow_core_dump, false,
 
 FLARE_OVERRIDE_FLAG(logbufsecs, 0);
 
-FLARE_OVERRIDE_FLAG(flare_rpc_server_max_packet_size, 67108864);
-FLARE_OVERRIDE_FLAG(flare_rpc_channel_max_packet_size, 67108864);
+FLARE_OVERRIDE_FLAG(flare_buffer_block_size, "64K");
+FLARE_OVERRIDE_FLAG(flare_rpc_server_max_packet_size, 512 * 1048576);
+FLARE_OVERRIDE_FLAG(flare_rpc_channel_max_packet_size, 512 * 1048576);
 
 // We don't want too many connections. Linux force a TCP slow-start after a
 // connection has been idle for a while (hundreds of milliseconds, depending on
@@ -94,6 +97,9 @@ FLARE_OVERRIDE_FLAG(flare_rpc_channel_max_packet_size, 67108864);
 // Hopefully Flare will support QUIC to help us to get ride of this restriction.
 FLARE_OVERRIDE_FLAG(flare_rpc_client_max_connections_per_server, 2);
 FLARE_OVERRIDE_FLAG(flare_concurrency_hint, 4);  // Large enough.
+
+// We'll likely to be open may files (at least one to each client.).
+FLARE_OVERRIDE_FLAG(flare_override_rlimit_nofile, 8192);
 
 namespace yadcc::daemon {
 
@@ -130,16 +136,22 @@ std::string GetPrivateNetworkAddress() {
 // This method usually is effectively a no-op. But in case we crashed last run,
 // this method clears up our workspace.
 void RemoveTemporaryFilesCreateDuringOurPastLife() {
-  std::unique_ptr<DIR, void (*)(DIR*)> dir{opendir(FLAGS_temporary_dir.c_str()),
+  std::unique_ptr<DIR, void (*)(DIR*)> dir{opendir(GetTemporaryDir().c_str()),
                                            [](auto ptr) { closedir(ptr); }};
-  FLARE_CHECK(dir, "Failed to open `{}`.", FLAGS_temporary_dir);
+  FLARE_CHECK(dir, "Failed to open `{}`.", GetTemporaryDir());
 
   while (auto ep = readdir(dir.get())) {
-    if (flare::StartsWith(ep->d_name, "yadcc_")) {
-      auto fullname = flare::Format("{}/{}", FLAGS_temporary_dir, ep->d_name);
+    std::string_view path(ep->d_name);
+    auto fullname = flare::Format("{}/{}", GetTemporaryDir(), path);
+    if (flare::StartsWith(path, "yadcc_")) {
       if (unlink(fullname.c_str()) != 0) {
-        FLARE_LOG_WARNING("Failed to remove [{}]: [{}] {}", fullname, errno,
-                          strerror(errno));
+        if (errno == EISDIR) {
+          RemoveDirs(fullname);
+          FLARE_LOG_INFO("Removed [{}]", fullname);
+        } else {
+          FLARE_LOG_WARNING("Failed to remove [{}]: [{}] {}", fullname, errno,
+                            strerror(errno));
+        }
       } else {
         FLARE_LOG_INFO("Removed [{}]", fullname);
       }
@@ -168,12 +180,14 @@ int DaemonStart(int argc, char** argv) {
     DisableCoreDump();
   }
 
+  FLARE_LOG_INFO("Using [{}] as temporary directory.", GetTemporaryDir());
+
   // Remove everything matches `{temp_dir}/yadcc_*`. If there are any, those
   // files are there because we didn't exit cleanly last time.
   RemoveTemporaryFilesCreateDuringOurPastLife();
 
   // Initialize the singletons early..
-  cloud::InitializeSystemInfo();
+  InitializeSystemInfo();
   (void)cloud::CompilerRegistry::Instance();
   (void)cloud::DistributedCacheWriter::Instance();
   (void)local::DistributedCacheReader::Instance();
@@ -192,7 +206,10 @@ int DaemonStart(int argc, char** argv) {
   flare::ServerGroup server_group;
 
   // Initialize daemon serving requests from local client.
-  auto local_daemon = std::make_unique<flare::Server>();
+  auto local_daemon = std::make_unique<flare::Server>(
+      // To support Java client, local daemon needs to be able to handle really
+      // large packet.
+      flare::Server::Options{.maximum_packet_size = 1 * 1024 * 1024 * 1024});
   local_daemon->AddProtocol("http");
   local_daemon->AddHttpHandler(std::regex(R"(\/local\/.*)"),
                                std::make_unique<local::HttpServiceImpl>());
@@ -220,21 +237,23 @@ int DaemonStart(int argc, char** argv) {
   // Wait until asked to quit.
   flare::WaitForQuitSignal();
 
-  // Stop accessing new requests.
+  // Stop accepting new requests.
   server_group.Stop();
 
-  // Flush running tasks.
+  // Shutdown subsystems.
+  cloud::CompilerRegistry::Instance()->Stop();
   cloud::ExecutionEngine::Instance()->Stop();
   cloud::DistributedCacheWriter::Instance()->Stop();
   local::DistributedTaskDispatcher::Instance()->Stop();
   local::DistributedCacheReader::Instance()->Stop();
   daemon_svc.Stop();
 
+  cloud::CompilerRegistry::Instance()->Join();
   cloud::ExecutionEngine::Instance()->Join();
   cloud::DistributedCacheWriter::Instance()->Join();
   local::DistributedTaskDispatcher::Instance()->Join();
   local::DistributedCacheReader::Instance()->Join();
-  cloud::ShutdownSystemInfo();
+  ShutdownSystemInfo();
   daemon_svc.Join();
 
   server_group.Join();

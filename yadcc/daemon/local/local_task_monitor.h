@@ -19,8 +19,8 @@
 #include <cinttypes>
 #include <unordered_set>
 
-#include "thirdparty/googletest/gtest/gtest_prod.h"
-#include "thirdparty/jsoncpp/json.h"
+#include "gtest/gtest_prod.h"
+#include "jsoncpp/json.h"
 
 #include "flare/base/exposed_var.h"
 #include "flare/fiber/condition_variable.h"

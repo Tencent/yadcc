@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-#include "thirdparty/jsoncpp/value.h"
+#include "jsoncpp/value.h"
 
 #include "flare/base/buffer.h"
 

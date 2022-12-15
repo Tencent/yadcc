@@ -22,7 +22,7 @@
 #include <mutex>
 #include <vector>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/internal/time_view.h"
 #include "flare/base/logging.h"
@@ -90,24 +90,36 @@ TaskDispatcher::~TaskDispatcher() {
   flare::fiber::KillTimer(expiration_timer_);
 }
 
-std::optional<TaskAllocation> TaskDispatcher::WaitForStartingNewTask(
+flare::Expected<TaskAllocation, WaitStatus>
+TaskDispatcher::WaitForStartingNewTask(
     const TaskPersonality& personality, std::chrono::nanoseconds expires_in,
-    std::chrono::nanoseconds timeout, bool prefetching) {
+    std::chrono::steady_clock::time_point timeout, bool prefetching) {
   // FIXME: Maybe we should bail out immediately if the requested compiler
   // digest is not recognized. Doing this allows the user to fallback to its
   // local compiler. Otherwise the user would wait indefinitely.
 
   std::unique_lock lk(allocation_lock_);
-  std::vector<ServantDesc*> servants_eligible;
-  if (!allocation_cv_.wait_for(lk, timeout, [&] {
-        servants_eligible = UnsafeEnumerateEligibleServants(personality);
-        return !servants_eligible.empty();
-      })) {
-    return std::nullopt;
+  std::vector<ServantDesc*> servants_free;
+  while (true) {
+    auto servants_eligible = UnsafeEnumerateEligibleServants(personality);
+    if (servants_eligible.empty()) {
+      // If the environment is not recognized, bail out early.
+      return WaitStatus::EnvironmentNotFound;
+    }
+    servants_free = UnsafeEnumerateFreeServants(servants_eligible);
+    if (!servants_free.empty()) {
+      // We've got at least one servant, keep going.
+      break;
+    }
+
+    // Wait for available servant then.
+    if (allocation_cv_.wait_until(lk, timeout) == std::cv_status::timeout) {
+      return WaitStatus::Timeout;
+    }
   }
 
   // A eligible servant is available.
-  auto pick = UnsafePickServantFor(servants_eligible, personality.requestor_ip);
+  auto pick = UnsafePickServantFor(servants_free, personality.requestor_ip);
   ++pick->running_tasks;
   ++pick->ever_assigned_tasks;
 
@@ -207,11 +219,15 @@ void TaskDispatcher::KeepServantAlive(const ServantPersonality& servant,
   }
 }
 
-std::vector<std::uint64_t> TaskDispatcher::ExamineRunningTasks(
-    const std::string& servant_location,
-    const std::vector<std::uint64_t>& running_tasks) {
-  std::scoped_lock _(allocation_lock_);
+std::vector<std::uint64_t> TaskDispatcher::NotifyServantRunningTasks(
+    const std::string& servant_location, std::vector<RunningTask> tasks) {
+  std::vector<std::uint64_t> task_grant_ids;
 
+  std::transform(tasks.begin(), tasks.end(),
+                 std::back_insert_iterator(task_grant_ids),
+                 [](const RunningTask& t) { return t.task_grant_id(); });
+
+  std::scoped_lock _(allocation_lock_);
   // Find the servant's descriptor first.
   ServantDesc* servant = nullptr;
   for (auto&& e : servants_.servants) {
@@ -223,7 +239,7 @@ std::vector<std::uint64_t> TaskDispatcher::ExamineRunningTasks(
 
   // The servant itself has expired?
   if (!servant) {
-    return running_tasks;
+    return task_grant_ids;
   }
 
   // For any tasks marked as zombie and not recognized by the servant, they're
@@ -235,7 +251,7 @@ std::vector<std::uint64_t> TaskDispatcher::ExamineRunningTasks(
   // task, we're safe. (Otherwise we may overschedule tasks to the node and
   // result in task rejection. This, in turn, should be handled by the client
   // itself.).
-  UnsafeSweepZombiesOf(servant, {running_tasks.begin(), running_tasks.end()});
+  UnsafeSweepZombiesOf(servant, {task_grant_ids.begin(), task_grant_ids.end()});
 
   // Any tasks reported by the servant but unknown to us should be returned.
   std::unordered_set<std::uint64_t> permitted_tasks;
@@ -245,20 +261,30 @@ std::vector<std::uint64_t> TaskDispatcher::ExamineRunningTasks(
     }
   }
   std::vector<std::uint64_t> unknown_tasks;
-  for (auto&& e : running_tasks) {
-    if (!permitted_tasks.count(e)) {
-      unknown_tasks.push_back(e);
+  for (auto it = tasks.begin(); it != tasks.end();) {
+    if (!permitted_tasks.count(it->task_grant_id())) {
+      unknown_tasks.push_back(it->task_grant_id());
       FLARE_VLOG(1, "Servant [{}] reported a unknown task [{}].",
-                 servant->personality.observed_location, e);
+                 servant->personality.observed_location, it->task_grant_id());
+      it = tasks.erase(it);
+    } else {
+      ++it;
     }
   }
+  running_task_bookkeeper_.SetServantRunningTasks(servant_location,
+                                                  std::move(tasks));
   return unknown_tasks;
+}
+
+std::vector<RunningTask> TaskDispatcher::GetRunningTasks() const {
+  return running_task_bookkeeper_.GetRunningTasks();
 }
 
 std::size_t TaskDispatcher::GetCapacityAvailable(
     const ServantDesc& servant_desc) const noexcept {
-  if (servant_desc.personality.memory_available_in_bytes <
-      min_memory_for_new_task_) {
+  auto&& personality = servant_desc.personality;
+  if (personality.total_memory_in_bytes /* It's reported? */ &&
+      personality.memory_available_in_bytes < min_memory_for_new_task_) {
     // Due to low memory condition, no new task can be acceptable. Therefore we
     // mark its capacity as the number of running tasks to prevent more tasks to
     // be dispatched to it.
@@ -280,10 +306,10 @@ std::size_t TaskDispatcher::GetCapacityAvailable(
   // This shouldn't hurt much, but it does reduce machine utilization when we're
   // heavy loaded.
   auto foreign_load = std::max<std::int64_t>(
-      servant_desc.personality.current_load - servant_desc.running_tasks, 0);
-  std::size_t capacity_available = std::max<std::int64_t>(
-      servant_desc.personality.num_processors - foreign_load, 0);
-  return std::min(servant_desc.personality.max_tasks, capacity_available);
+      personality.current_load - servant_desc.running_tasks, 0);
+  std::size_t capacity_available =
+      std::max<std::int64_t>(personality.num_processors - foreign_load, 0);
+  return std::min(personality.max_tasks, capacity_available);
 }
 
 // Allocation lock is held by the caller.
@@ -301,14 +327,13 @@ TaskDispatcher::UnsafeEnumerateEligibleServants(
                                  requesting_task.env_desc)) {
       continue;
     }
-    env_recognized = true;
-
-    // Task allocated can be greater than max allowed. This happens when the
-    // servant decreases its capacity after we've made some allocation (more
-    // than its new capacity).
-    if (e->running_tasks >= GetCapacityAvailable(*e)) {
+    if (e->personality.max_tasks == 0) {
       continue;
     }
+    if (e->personality.version < requesting_task.min_version) {
+      continue;
+    }
+    env_recognized = true;
     eligibles.push_back(e.Get());
   }
   FLARE_LOG_ERROR_IF_EVERY_SECOND(
@@ -318,8 +343,24 @@ TaskDispatcher::UnsafeEnumerateEligibleServants(
   return eligibles;
 }
 
+std::vector<TaskDispatcher::ServantDesc*>
+TaskDispatcher::UnsafeEnumerateFreeServants(
+    const std::vector<TaskDispatcher::ServantDesc*>& eligible_servants) {
+  std::vector<TaskDispatcher::ServantDesc*> free_servants;
+  for (auto& e : eligible_servants) {
+    // Task allocated can be greater than max allowed. This happens when the
+    // servant decreases its capacity after we've made some allocation (more
+    // than its new capacity).
+    if (e->running_tasks >= GetCapacityAvailable(*e)) {
+      continue;
+    }
+    free_servants.push_back(e);
+  }
+  return free_servants;
+}
+
 TaskDispatcher::ServantDesc* TaskDispatcher::UnsafePickServantFor(
-    std::vector<ServantDesc*> eligibles, const std::string& requestor) {
+    std::vector<ServantDesc*> servants, const std::string& requestor) {
   // TODO(luobogao): I think we'd better assign a servant that the requestor has
   // been using. This allows it to reuse TCP connection (avoid slow-start after
   // idle), batch RPCs, etc. (But be care of not to use SMTs unless there are no
@@ -329,22 +370,22 @@ TaskDispatcher::ServantDesc* TaskDispatcher::UnsafePickServantFor(
   // We prefer not to assign requestor's task to itself. This should leave more
   // resource to it for "non-distributable" work such as preprocessing.
   ServantDesc* self = nullptr;
-  auto iter = std::find_if(eligibles.begin(), eligibles.end(), [&](auto&& e) {
+  auto iter = std::find_if(servants.begin(), servants.end(), [&](auto&& e) {
     return IsNetworkAddressEqual(e->personality.observed_location, requestor);
   });
-  if (iter != eligibles.end()) {
+  if (iter != servants.end()) {
     self = *iter;
-    eligibles.erase(iter);
+    servants.erase(iter);
   }
 
   // If we can use a dedicated servant. Prefer it.
-  if (auto ptr = UnsafeTryPickDedicatedServantFor(eligibles)) {
+  if (auto ptr = UnsafeTryPickDedicatedServantFor(servants)) {
     return ptr;
   }
 
   // Otherwise let's see if we can use a servant other than the requestor
   // itself.
-  if (auto ptr = UnsafeTryPickAvailableServantFor(eligibles)) {
+  if (auto ptr = UnsafeTryPickAvailableServantFor(servants)) {
     return ptr;
   }
 
@@ -356,34 +397,34 @@ TaskDispatcher::ServantDesc* TaskDispatcher::UnsafePickServantFor(
 }
 
 TaskDispatcher::ServantDesc* TaskDispatcher::UnsafeTryPickDedicatedServantFor(
-    const std::vector<ServantDesc*>& eligibles) {
+    const std::vector<ServantDesc*>& servants) {
   // If there's a dedicated servant who hasn't reach 50% load, use it.
   //
   // FIXME: The 50% heuristic only applies if (2-way) SMT is enabled. We should
   // report whether the servant enables SMT (and if yes, how many ways of SMTs
   // are enabled), and refine the 50% check accordingly.
-  return UnsafeTryPickServantFor(eligibles, [](auto&& e) {
+  return UnsafeTryPickServantFor(servants, [](auto&& e) {
     return e.personality.priority == SERVANT_PRIORITY_DEDICATED &&
            e.running_tasks * 2 < e.personality.num_processors;
   });
 }
 
 TaskDispatcher::ServantDesc* TaskDispatcher::UnsafeTryPickAvailableServantFor(
-    const std::vector<ServantDesc*>& eligibles) {
-  return UnsafeTryPickServantFor(eligibles, [](auto&&) { return true; });
+    const std::vector<ServantDesc*>& servants) {
+  return UnsafeTryPickServantFor(servants, [](auto&&) { return true; });
 }
 
 template <class F>
 TaskDispatcher::ServantDesc* TaskDispatcher::UnsafeTryPickServantFor(
-    const std::vector<ServantDesc*>& eligibles, F&& pred) {
-  if (eligibles.empty()) {
+    const std::vector<ServantDesc*>& servants, F&& pred) {
+  if (servants.empty()) {
     return nullptr;
   }
 
   ServantDesc* result = nullptr;
   double min_utilization = std::numeric_limits<double>::max();
 
-  for (auto&& e : eligibles) {
+  for (auto&& e : servants) {
     // This can't change unless the lock was released during enumeration and
     // pick.
     FLARE_CHECK_GT(e->personality.max_tasks, e->running_tasks);
@@ -466,6 +507,8 @@ void TaskDispatcher::OnExpirationTimer() {
           "Removing expired servant [{}]. It served us for {} seconds.",
           (*iter)->personality.observed_location,
           (flare::ReadCoarseSteadyClock() - (*iter)->discovered_at) / 1s);
+      running_task_bookkeeper_.DropServant(
+          (*iter)->personality.observed_location);
       iter = servants_.servants.erase(iter);
     } else {
       ++iter;
@@ -529,6 +572,10 @@ Json::Value TaskDispatcher::DumpInternals() {
     item["current_load"] = static_cast<Json::UInt64>(personality.current_load);
     item["capacity_available"] =
         static_cast<Json::Int64>(GetCapacityAvailable(*entry));
+    item["total_memory_mb"] = static_cast<Json::UInt64>(
+        personality.total_memory_in_bytes / 1024 / 1024);
+    item["memory_available_mb"] = static_cast<Json::UInt64>(
+        personality.memory_available_in_bytes / 1024 / 1024);
     item["running_tasks"] = static_cast<Json::UInt64>(entry->running_tasks);
     item["ever_assigned_tasks"] =
         static_cast<Json::UInt64>(entry->ever_assigned_tasks);

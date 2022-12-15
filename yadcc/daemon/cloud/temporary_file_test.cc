@@ -16,7 +16,7 @@
 
 #include <unistd.h>
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 #include "flare/base/buffer.h"
 #include "flare/base/string.h"
@@ -27,6 +27,36 @@ TEST(TemporaryFile, All) {
   TemporaryFile file("/tmp");
 
   EXPECT_TRUE(flare::StartsWith(file.GetPath(), "/tmp/"));
+  EXPECT_NE(0, file.fd());
+  file.Write(flare::CreateBufferSlow("hello"));
+  EXPECT_EQ("hello", flare::FlattenSlow(file.ReadAll()));
+}
+
+TEST(TemporaryFile, Move) {
+  TemporaryFile file("/tmp");
+  EXPECT_TRUE(flare::StartsWith(file.GetPath(), "/tmp/"));
+  EXPECT_NE(0, file.fd());
+
+  auto file2 = std::move(file);
+  EXPECT_TRUE(flare::StartsWith(file2.GetPath(), "/tmp/"));
+  EXPECT_NE(0, file2.fd());
+  EXPECT_TRUE(file.GetPath().empty());
+  EXPECT_EQ(0, file.fd());
+
+  TemporaryFile file3;
+  EXPECT_TRUE(file3.GetPath().empty());
+  EXPECT_EQ(0, file3.fd());
+  file3 = std::move(file2);
+  EXPECT_TRUE(flare::StartsWith(file3.GetPath(), "/tmp/"));
+  EXPECT_NE(0, file3.fd());
+  EXPECT_TRUE(file2.GetPath().empty());
+  EXPECT_EQ(0, file2.fd());
+}
+
+TEST(TemporaryFile, Prefix) {
+  TemporaryFile file("/dev/shm");
+
+  EXPECT_TRUE(flare::StartsWith(file.GetPath(), "/dev/shm"));
   EXPECT_NE(0, file.fd());
   file.Write(flare::CreateBufferSlow("hello"));
   EXPECT_EQ("hello", flare::FlattenSlow(file.ReadAll()));

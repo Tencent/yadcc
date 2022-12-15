@@ -23,17 +23,25 @@
 #include <unordered_set>
 #include <vector>
 
-#include "thirdparty/jsoncpp/value.h"
+#include "gtest/gtest_prod.h"
+#include "jsoncpp/value.h"
 
+#include "flare/base/expected.h"
 #include "flare/base/exposed_var.h"
 #include "flare/base/ref_ptr.h"
 #include "flare/fiber/condition_variable.h"
 #include "flare/fiber/mutex.h"
 
 #include "yadcc/api/env_desc.pb.h"
-#include "yadcc/api/scheduler.flare.pb.h"
+#include "yadcc/api/scheduler.pb.h"
+#include "yadcc/scheduler/running_task_bookkeeper.h"
 
 namespace yadcc::scheduler {
+
+enum class WaitStatus {
+  EnvironmentNotFound = 0,
+  Timeout = 1,
+};
 
 // Describes several aspect of a task. The dispatcher may use these information
 // to determine which node should be allocated to this task.
@@ -44,6 +52,9 @@ struct TaskPersonality {
   // result" returned by the compile-server. In untrusted environment this can
   // be dangerous.)
   std::string requestor_ip;
+
+  // Minimal daemon version specified.
+  std::uint32_t min_version;
 
   // We can only allocate compile-server that recognizes this environment to the
   // client. Otherwise the server we allocated will have no toolchain to serve
@@ -85,8 +96,8 @@ struct ServantPersonality {
   // Maximum cpu core of daemon machine
   std::size_t num_processors;
 
-  // Maximum concurrent task this servant can process.
-  std::size_t max_tasks;
+  // Recent load average
+  std::size_t current_load;
 
   // Total memory of this servant.
   std::size_t total_memory_in_bytes;
@@ -94,14 +105,14 @@ struct ServantPersonality {
   // Available memory of this servant.
   std::size_t memory_available_in_bytes;
 
+  // Maximum concurrent task this servant can process.
+  std::size_t max_tasks;
+
   // Priority of this servant.
   ServantPriority priority;
 
   // Reason why `max_tasks` is zero.
   NotAcceptingTaskReason not_accepting_task_reason;
-
-  // Recent load average
-  std::size_t current_load;
 };
 
 // This class is responsible for assigning compile-server to requestor. The
@@ -125,9 +136,9 @@ class TaskDispatcher {
   //
   // If no allocation can be done in `timeout`, this methods fails with
   // `std::nullopt`.
-  std::optional<TaskAllocation> WaitForStartingNewTask(
+  flare::Expected<TaskAllocation, WaitStatus> WaitForStartingNewTask(
       const TaskPersonality& personality, std::chrono::nanoseconds expires_in,
-      std::chrono::nanoseconds timeout, bool prefetching);
+      std::chrono::steady_clock::time_point timeout, bool prefetching);
 
   // Expands a task's allocation to `new_expires_in`.
   //
@@ -155,16 +166,19 @@ class TaskDispatcher {
   void KeepServantAlive(const ServantPersonality& servant,
                         std::chrono::nanoseconds expires_in);
 
-  // Examine running tasks reported by the servant. This method is called as a
+  // Update running tasks reported by the servant. This method is called as a
   // result of servant heartbeat.
   //
   // If the dispatcher found any task(s) unknown to it, the corresponding task
   // ID(s) will be returned. The reporting servant is free (and advised) to kill
   // these unknown (presumably because of task allocation auto-expiration)
   // tasks.
-  std::vector<std::uint64_t> ExamineRunningTasks(
-      const std::string& servant_location,  // TODO(luobogao): Use UUID here.
-      const std::vector<std::uint64_t>& running_tasks);
+  std::vector<std::uint64_t> NotifyServantRunningTasks(
+      const std::string& servant_location, std::vector<RunningTask> tasks);
+
+  // Get all running compilation tasks reported by heartbeats of daemons.
+  // Because of network delay problems, this infomation may be out of data.
+  std::vector<RunningTask> GetRunningTasks() const;
 
  private:
   struct ServantDesc : public flare::RefCounted<ServantDesc> {
@@ -217,28 +231,31 @@ class TaskDispatcher {
   std::vector<ServantDesc*> UnsafeEnumerateEligibleServants(
       const TaskPersonality& requesting_task);
 
+  std::vector<ServantDesc*> UnsafeEnumerateFreeServants(
+      const std::vector<ServantDesc*>& eligible_servants);
+
   // Pick a servant for handling this request. The implementation may do some
   // heuristics for optimizing workload distribution.
   //
   // Allocation lock must be held by the caller. This guarantees validity of
-  // pointers in `eligibles`.
-  ServantDesc* UnsafePickServantFor(std::vector<ServantDesc*> eligibles,
+  // pointers in `servants`.
+  ServantDesc* UnsafePickServantFor(std::vector<ServantDesc*> servants,
                                     const std::string& requestor);
 
   // Pick a dedicated (if available) servant for the given request. If no
   // dedicated servant is idle enough for new request, this method may return
   // null.
   ServantDesc* UnsafeTryPickDedicatedServantFor(
-      const std::vector<ServantDesc*>& eligibles);
+      const std::vector<ServantDesc*>& servants);
 
   // Pick a servant for the given request.
   ServantDesc* UnsafeTryPickAvailableServantFor(
-      const std::vector<ServantDesc*>& eligibles);
+      const std::vector<ServantDesc*>& servants);
 
   // Pick a servant that satisfies the given predicate.
   template <class F>
   ServantDesc* UnsafeTryPickServantFor(
-      const std::vector<ServantDesc*>& eligibles, F&& pred);
+      const std::vector<ServantDesc*>& servants, F&& pred);
 
   // Forget about tasks that are marked as "zombie" and no longer recognized by
   // the corresponding servant.
@@ -257,6 +274,8 @@ class TaskDispatcher {
   Json::Value DumpInternals();
 
  private:
+  FRIEND_TEST(SchedulerServiceImpl, TokenWithIntersection);
+  FRIEND_TEST(SchedulerServiceImpl, TokenWithoutIntersection);
   std::uint64_t expiration_timer_;
 
   // Note that the current implementation doesn't scale well. Each time a
@@ -273,6 +292,8 @@ class TaskDispatcher {
   // Protected by `allocation_lock_`.
   ServantRegistry servants_;
   TaskRegistry tasks_;
+
+  RunningTaskBookkeeper running_task_bookkeeper_;
 
   // Exposes some internals for debugging.
   flare::ExposedVarDynamic<Json::Value> internal_exposer_;

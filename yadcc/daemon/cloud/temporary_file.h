@@ -18,6 +18,7 @@
 #include <string>
 
 #include "flare/base/buffer.h"
+#include "flare/base/handle.h"
 
 namespace yadcc::daemon::cloud {
 
@@ -35,7 +36,7 @@ class TemporaryFile {
   TemporaryFile(TemporaryFile&& file) noexcept;
   TemporaryFile& operator=(TemporaryFile&& file) noexcept;
 
-  int fd() const noexcept { return fd_; }
+  int fd() const noexcept { return fd_.Get(); }
 
   const std::string& GetPath() const noexcept { return path_; }
 
@@ -45,7 +46,7 @@ class TemporaryFile {
   void Close();
 
  private:
-  int fd_ = 0;
+  flare::Handle fd_;
   std::string path_;
 };
 

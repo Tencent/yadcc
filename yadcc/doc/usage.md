@@ -4,19 +4,19 @@
 
 编译完成后，至少需要启动如下服务：
 
-- 需要一台用于调度任务的机器，并运行`yadcc/scheduler/yadcc-scheduler`。具体使用可以参考[调度器文档](yadcc/doc/scheduler.md)。如：`./yadcc-scheduler --acceptable_tokens=some_fancy_token`。
+- 需要一台用于调度任务的机器，并运行`yadcc/scheduler/yadcc-scheduler`。具体使用可以参考[调度器文档](scheduler.md)。如：`./yadcc-scheduler --acceptable_tokens=some_fancy_token`。
 
   *尽管生产环境中不推荐，测试时调度机可以和编译机、用户机位于同一台机器。*
 
 为了加速编译（用户**之间**互相共享编译结果），还可以启动如下服务：
 
-- 缓存服务器上运行`yadcc/cache/yadcc-cache`。具体使用可以参考[缓存服务器文档](yadcc/doc/cache.md)。如：`./yadcc-cache --acceptable_tokens=some_fancy_token`。
+- 缓存服务器上运行`yadcc/cache/yadcc-cache`。具体使用可以参考[缓存服务器文档](cache.md)。如：`./yadcc-cache --acceptable_tokens=some_fancy_token`。
 
   *尽管生产环境中不推荐，测试时缓存服务器可以和调度器、编译机、用户机位于同一台机器。*
 
   缓存服务器并非必须，但是对于基于大仓库的开发模式而言，往往不同用户之间可以共享编译缓存，此时缓存服务器会有一定的收益。
 
-另外，在搭建过程中如果遇到一些问题，也可以参考我们的[调试文档](yadcc/doc/debugging.md)来尝试定位。
+另外，在搭建过程中如果遇到一些问题，也可以参考我们的[调试文档](debugging.md)来尝试定位。
 
 ## 使用
 
@@ -24,7 +24,7 @@
 
 ### 启动守护进程
 
-每台客户机上需要启动`yadcc`的守护进程（位于`yadcc/daemon/yadcc-daemon`，不需要`root`权限），具体使用可参考[守护进程文档](yadcc/doc/daemon.md)。如：`./yadcc-daemon --scheduler_uri=flare://ip-port-of-scheduler --cache_server_uri=flare://ip-port-of-cache-server --token=some_fancy_token`。
+每台客户机上需要启动`yadcc`的守护进程（位于`yadcc/daemon/yadcc-daemon`，不需要`root`权限），具体使用可参考[守护进程文档](daemon.md)。如：`./yadcc-daemon --scheduler_uri=flare://ip-port-of-scheduler --cache_server_uri=flare://ip-port-of-cache-server --token=some_fancy_token`。
 
 需要注意的是，**低配机器（CPU核心数小于等于`--poor_machine_threshold_processors`，默认16）默认不接受任务**，其余机器默认贡献40%的CPU至集群。
 
@@ -96,11 +96,9 @@ CXX='/path/to/yadcc g++' CC='/path/to/yadcc gcc' LD='/path/to/yadcc g++' ./blade
 
 ### Bazel
 
-Bazel 需要通过 [--jobs](https://docs.bazel.build/versions/master/user-manual.html#flag--jobs) 参数指定任务数，比如 `--jobs=100`。
+*`bazel`默认会限制并发度到其估计的机器性能上限，实际使用需要通过`--local_cpu_resources=9999999 --local_ram_resources=999999`等参数绕过这一限制。*
 
-*`bazel`默认会限制并发度到其估计的机器性能上限，实际使用还需要通过`--local_cpu_resources=9999999 --local_ram_resources=999999`等参数绕过这一限制。*
-
-我们**已知（部分版本的）`bazel`在并发度过高下，`bazel`自身性能存在瓶颈**（如我们内部常用的`-j512`。事实上，根据我们观察，160并发`bazel`已经不能很好的支撑）。
+我们**已知（部分版本的）`bazel`在并发度过高下，`bazel`自身性能存在瓶颈**（如我们内部常用的`-j320`。事实上，根据我们观察，160并发`bazel`已经不能很好的支撑）。
 
 这具体表现为机器空闲但不会启动更多编译任务，同时`bazel`自身CPU（400~500%）、内存（几G）占用很高。
 

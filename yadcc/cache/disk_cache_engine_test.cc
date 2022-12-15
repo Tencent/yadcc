@@ -17,26 +17,27 @@
 #include <chrono>
 #include <fstream>
 
-#include "thirdparty/gflags/gflags_declare.h"
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gflags/gflags_declare.h"
+#include "gtest/gtest.h"
 
 #include "flare/base/buffer.h"
 #include "flare/base/random.h"
 #include "flare/base/string.h"
 #include "flare/init/override_flag.h"
 
-#include "yadcc/cache/dir.h"
+#include "yadcc/common/dir.h"
 
 using namespace std::literals;
 
-DECLARE_string(cache_dirs);
-DECLARE_string(action_on_misplaced_cache_entry);
+DECLARE_string(disk_engine_cache_dirs);
+DECLARE_string(disk_engine_action_on_misplaced_cache_entry);
 
 namespace yadcc::cache {
 
 TEST(DiskCacheEngine, MutilDirs) {
   {
-    FLAGS_cache_dirs = "1048576,./multicache/0:1048576,./multicache/1";
+    FLAGS_disk_engine_cache_dirs =
+        "1048576,./multicache/0:1048576,./multicache/1";
     DiskCacheEngine cache;
     for (int i = 0; i != 100; ++i) {
       cache.Put(flare::Format("my-key-{}", i),
@@ -49,9 +50,9 @@ TEST(DiskCacheEngine, MutilDirs) {
   }
 
   {
-    FLAGS_cache_dirs =
+    FLAGS_disk_engine_cache_dirs =
         "1048576,./multicache/0:1048576,./multicache/1:1048576,./multicache/2";
-    FLAGS_action_on_misplaced_cache_entry = "move";
+    FLAGS_disk_engine_action_on_misplaced_cache_entry = "move";
     DiskCacheEngine cache;
 
     for (int i = 0; i != 100; ++i) {
@@ -61,7 +62,7 @@ TEST(DiskCacheEngine, MutilDirs) {
 }
 
 TEST(DiskCacheEngine, All) {
-  FLAGS_cache_dirs = "1048576,./cache";
+  FLAGS_disk_engine_cache_dirs = "1048576,./cache";
   DiskCacheEngine cache;
 
   // Here we inserted more than `kMaxBytes` into the cache.
@@ -142,7 +143,7 @@ TEST(DiskCacheEngine, All) {
         } else {
           // Append to it.
           std::fstream fs(file, std::fstream::app | std::fstream::binary |
-              std::fstream::out);
+                                    std::fstream::out);
           auto size = flare::Random(1, 1234);
           for (int i = 0; i != size; ++i) {
             fs << flare::Random<char>();

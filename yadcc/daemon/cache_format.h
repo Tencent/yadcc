@@ -18,6 +18,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include "google/protobuf/any.pb.h"
 
 #include "flare/base/buffer.h"
 
@@ -29,13 +32,19 @@ struct CacheEntry {
   int exit_code;
   std::string standard_output;
   std::string standard_error;
-  flare::NoncontiguousBuffer object_file;
+
+  // Depending on source language. This field may contain more information about
+  // this cache entry.
+  google::protobuf::Any extra_info;
+
+  // Include k-v pairs packing with the method from 'flare/base/packing.h'.
+  flare::NoncontiguousBuffer files;
 };
 
-// Generate a Redis key for compilation cache.
-std::string GetCacheEntryKey(const EnvironmentDesc& desc,
-                             const std::string& invocation_arguments,
-                             const std::string_view& source_digest);
+// Generate a key for C++ compilation cache.
+std::string GetCxxCacheEntryKey(const EnvironmentDesc& desc,
+                                const std::string_view& invocation_arguments,
+                                const std::string_view& source_digest);
 
 // Serializes a compilation result.
 flare::NoncontiguousBuffer WriteCacheEntry(const CacheEntry& result);

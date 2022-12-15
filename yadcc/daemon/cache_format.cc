@@ -16,6 +16,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <string_view>
+#include <utility>
 
 #include "flare/base/buffer/zero_copy_stream.h"
 #include "flare/base/crypto/blake3.h"
@@ -24,6 +26,7 @@
 #include "flare/base/string.h"
 
 #include "yadcc/daemon/cache_meta.pb.h"
+#include "yadcc/daemon/common_flags.h"
 
 namespace yadcc::daemon {
 
@@ -36,7 +39,7 @@ namespace {
 // Little endian.
 struct CacheEntryHeader {
   std::uint32_t meta_size;
-  std::uint32_t object_file_size;
+  std::uint32_t files_size;
 
   // Not used. For the moment only Zstd is possible.
   std::uint32_t compression_algorithm;
@@ -50,13 +53,14 @@ static_assert(sizeof(CacheEntryHeader) == 12);
 // Compilation cache entry itself.  //
 //////////////////////////////////////
 
-std::string GetCacheEntryKey(const EnvironmentDesc& desc,
-                             const std::string& invocation_arguments,
-                             const std::string_view& source_digest) {
-  return flare::Format(
-      "yadcc-entry-{}",
-      flare::EncodeHex(flare::Blake3(
-          {desc.compiler_digest(), invocation_arguments, source_digest})));
+std::string GetCxxCacheEntryKey(const EnvironmentDesc& desc,
+                                const std::string_view& invocation_arguments,
+                                const std::string_view& source_digest) {
+  // Hash them all togher to keep key length managable.
+  return flare::Format("yadcc-cxx2-entry-{}",
+                       flare::EncodeHex(flare::Blake3(
+                           {"using-extra-info", desc.compiler_digest(),
+                            invocation_arguments, source_digest})));
 }
 
 flare::NoncontiguousBuffer WriteCacheEntry(const CacheEntry& result) {
@@ -66,20 +70,21 @@ flare::NoncontiguousBuffer WriteCacheEntry(const CacheEntry& result) {
   meta.set_exit_code(result.exit_code);
   meta.set_standard_output(result.standard_output);
   meta.set_standard_error(result.standard_error);
-  meta.set_object_file_digest(flare::Blake3(result.object_file));
+  *meta.mutable_extra_info() = result.extra_info;
+  meta.set_files_digest(flare::Blake3(result.files));
 
   CacheEntryHeader header;
   header.meta_size = meta.ByteSizeLong();
-  header.object_file_size = result.object_file.ByteSize();
+  header.files_size = result.files.ByteSize();
   flare::ToLittleEndian(&header.meta_size);
-  flare::ToLittleEndian(&header.object_file_size);
+  flare::ToLittleEndian(&header.files_size);
 
   builder.Append(&header, sizeof(CacheEntryHeader));
   {
     flare::NoncontiguousBufferOutputStream nbos(&builder);
     FLARE_CHECK(meta.SerializeToZeroCopyStream(&nbos));  // How can it fail?
   }
-  builder.Append(result.object_file);
+  builder.Append(result.files);
   return builder.DestructiveGet();
 }
 
@@ -92,16 +97,16 @@ std::optional<CacheEntry> TryParseCacheEntry(
   }
   flare::FlattenToSlow(buffer, &header, sizeof(header));
   flare::FromLittleEndian(&header.meta_size);
-  flare::FromLittleEndian(&header.object_file_size);
+  flare::FromLittleEndian(&header.files_size);
 
   if (buffer.ByteSize() <
-      sizeof(header) + header.meta_size + header.object_file_size) {
+      sizeof(header) + header.meta_size + header.files_size) {
     return std::nullopt;
   }
 
   buffer.Skip(sizeof(header));
   auto meta = buffer.Cut(header.meta_size);
-  auto object_file = buffer.Cut(header.object_file_size);
+  auto files = buffer.Cut(header.files_size);
 
   CacheMeta meta_msg;
   {
@@ -110,18 +115,15 @@ std::optional<CacheEntry> TryParseCacheEntry(
       return std::nullopt;
     }
   }
-  // For backward compatibility, we test `object_file_digest` before using it.
-  //
-  // TODO(luobogao): Always verify digest once we have most of our daemons
-  // upgraded.
-  if (!meta_msg.object_file_digest().empty() &&
-      flare::Blake3(object_file) != meta_msg.object_file_digest()) {
+  if (flare::Blake3(files) != meta_msg.files_digest()) {
     return std::nullopt;
   }
+
   return CacheEntry{.exit_code = meta_msg.exit_code(),
                     .standard_output = meta_msg.standard_output(),
                     .standard_error = meta_msg.standard_error(),
-                    .object_file = object_file};
+                    .extra_info = meta_msg.extra_info(),
+                    .files = files};
 }
 
 }  // namespace yadcc::daemon

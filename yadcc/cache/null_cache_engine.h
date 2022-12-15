@@ -19,10 +19,9 @@
 #include <string>
 #include <vector>
 
-#include "thirdparty/jsoncpp/value.h"
+#include "jsoncpp/value.h"
 
 #include "flare/base/buffer.h"
-#include "flare/base/dependency_registry.h"
 
 #include "yadcc/cache/cache_engine.h"
 
@@ -40,7 +39,7 @@ class NullCacheEngine : public CacheEngine {
   void Put(const std::string& key,
            const flare::NoncontiguousBuffer& bytes) override;
 
-  std::vector<std::string> Purge() override;
+  void Purge() override;
 
   Json::Value DumpInternals() const override;
 };

@@ -15,7 +15,7 @@
 #ifndef YADCC_DAEMON_COMMON_FLAGS_H_
 #define YADCC_DAEMON_COMMON_FLAGS_H_
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 // GFlags shared by multiple targets are declared here.
 
@@ -27,9 +27,6 @@ DECLARE_string(cache_server_uri);
 
 // Token to access scheduler / cache server.
 DECLARE_string(token);
-
-// Directory for storing temporary files.
-DECLARE_string(temporary_dir);
 
 namespace yadcc::daemon {
 

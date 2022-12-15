@@ -14,13 +14,27 @@
 
 #include "yadcc/daemon/cloud/compiler_registry.h"
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/googletest/gtest/gtest.h"
+#include <unistd.h>
+#include <cstdio>
 
+#include "gflags/gflags.h"
+#include "gtest/gtest.h"
+
+#include "flare/base/chrono.h"
 #include "flare/base/logging.h"
 #include "flare/base/string.h"
+#include "flare/fiber/fiber.h"
+#include "flare/fiber/this_fiber.h"
+#include "flare/init/override_flag.h"
+#include "flare/testing/main.h"
+
+#include "yadcc/common/dir.h"
+
+using namespace std::literals;
 
 DECLARE_string(extra_compiler_dirs);
+DECLARE_string(extra_compiler_bundle_dirs);
+FLARE_OVERRIDE_FLAG(compiler_rescan_interval, 1);
 
 namespace yadcc::daemon::cloud {
 
@@ -34,12 +48,19 @@ constexpr auto kSymlinkGccDigest =
 constexpr auto kSymlinkCcacheDigest =
     "913cefa83a568d15f15d84d715e449a002364a9c6079fb46a56d1381cfb773f5";
 
+int QueryDynamicCompilers() {
+  auto compilers = CompilerRegistry::Instance()->EnumerateEnvironments();
+  return compilers.size();
+}
+
 TEST(CompilerRegistry, All) {
+  FLAGS_extra_compiler_bundle_dirs = "test-bin/:/path/not/exist";
   FLAGS_extra_compiler_dirs =
       "test-bin/native-gcc/:"
       "test-bin/symlink-ccache/:"
       "test-bin/symlink-gcc/:"
-      "test-bin/symlink-to-404/";
+      "test-bin/symlink-to-404/:"
+      "/path/not/exist";
 
   // blade does not handle symlinks in `testdata` well, so we generate the
   // symlinks ourselves.
@@ -73,4 +94,57 @@ TEST(CompilerRegistry, All) {
             CompilerRegistry::Instance()->TryGetCompilerPath(desc));
 }
 
+TEST(CompilerRegistry, Delete) {
+  int size1, size2;
+  auto now = flare::ReadSteadyClock();
+
+  CompilerRegistry::Instance()->OnCompilerRescanTimer();
+  size1 = QueryDynamicCompilers();
+
+  FLARE_PCHECK(rename("./test-bin/1/bin/g++", "./test-bin/g++") == 0);
+  CompilerRegistry::Instance()->OnCompilerRescanTimer();
+  size2 = QueryDynamicCompilers();
+  EXPECT_EQ(1, size1 - size2);
+
+  FLARE_PCHECK(rename("./test-bin/g++", "./test-bin/tmp") == 0);
+  CompilerRegistry::Instance()->OnCompilerRescanTimer();
+  size2 = QueryDynamicCompilers();
+  EXPECT_EQ(1, size1 - size2);
+
+  FLARE_PCHECK(rename("./test-bin/tmp", "./test-bin/1/bin/g++") == 0);
+  CompilerRegistry::Instance()->OnCompilerRescanTimer();
+  size2 = QueryDynamicCompilers();
+  EXPECT_EQ(0, size1 - size2);
+}
+
+TEST(CompilerRegistry, Stability) {
+  flare::Fiber move = flare::Fiber([] {
+    auto start_time = flare::ReadSteadyClock();
+    while (flare::ReadSteadyClock() - start_time < 3s) {
+      FLARE_PCHECK(rename("./test-bin/1/bin/g++", "./test-bin/temp") == 0);
+      flare::this_fiber::SleepFor(100us);
+      FLARE_PCHECK(rename("./test-bin/temp", "./test-bin/g++") == 0);
+      flare::this_fiber::SleepFor(100us);
+      FLARE_PCHECK(rename("./test-bin/g++", "./test-bin/1/bin/g++") == 0);
+    }
+  });
+  flare::Fiber query = flare::Fiber([] {
+    auto start_time = flare::ReadSteadyClock();
+    while (flare::ReadSteadyClock() - start_time < 3s) {
+      CompilerRegistry::Instance()->EnumerateEnvironments();
+    }
+  });
+  flare::Fiber update = flare::Fiber([] {
+    auto start_time = flare::ReadSteadyClock();
+    while (flare::ReadSteadyClock() - start_time < 3s) {
+      CompilerRegistry::Instance()->OnCompilerRescanTimer();
+    }
+  });
+  move.join();
+  query.join();
+  update.join();
+}
+
 }  // namespace yadcc::daemon::cloud
+
+FLARE_TEST_MAIN

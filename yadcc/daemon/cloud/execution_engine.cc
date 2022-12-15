@@ -17,7 +17,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -28,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/internal/cpu.h"
 #include "flare/base/logging.h"
@@ -40,12 +39,14 @@
 
 #include "yadcc/common/parse_size.h"
 #include "yadcc/daemon/cloud/execute_command.h"
-#include "yadcc/daemon/cloud/sysinfo.h"
+#include "yadcc/daemon/common_flags.h"
+#include "yadcc/daemon/sysinfo.h"
+#include "yadcc/daemon/temp_dir.h"
 
 using namespace std::literals;
 
 DEFINE_int32(
-    max_remote_tasks, 0,
+    max_remote_tasks, -1,
     "Maximum number of tasks (accepted from network) can be executed "
     "concurrently. If not specified, it's determined by `--servant_priority`.");
 DEFINE_string(servant_priority, "user",
@@ -54,7 +55,7 @@ DEFINE_string(servant_priority, "user",
               "utilization ratio to 95%.");
 DEFINE_string(
     min_memory_for_starting_new_task, "2G",
-    "If memory avaiable is less than `min_memory_for_starting_new_task`, "
+    "If memory available is less than `min_memory_for_starting_new_task`, "
     "task will fail to start.");
 DEFINE_int32(
     poor_machine_threshold_processors, 16,
@@ -103,9 +104,7 @@ ExecutionEngine::ExecutionEngine()
   min_memory_for_starting_new_task_ = *memory;
 
   auto nprocs = flare::internal::GetNumberOfProcessorsAvailable();
-  if (FLAGS_max_remote_tasks) {
-    task_concurrency_limit_ = FLAGS_max_remote_tasks;
-  } else {
+  if (FLAGS_max_remote_tasks == -1) {
     if (FLAGS_servant_priority == "dedicated") {
       // Don't try to achieve 100% CPU usage. In our deployment environment
       // beforing achieving that high CPU utilization we'll likely use up all
@@ -137,7 +136,14 @@ ExecutionEngine::ExecutionEngine()
         task_concurrency_limit_ = nprocs * 40 / 100;
       }
     }
+  } else if (FLAGS_max_remote_tasks == 0) {
+    task_concurrency_limit_ = 0;
+    not_accepting_task_reason_ = NotAcceptingTaskReason::UserInstructed;
+  } else {
+    FLARE_CHECK_GT(FLAGS_max_remote_tasks, 0);
+    task_concurrency_limit_ = FLAGS_max_remote_tasks;
   }
+
   if (task_concurrency_limit_) {
     FLARE_LOG_INFO("We'll serve at most {} tasks simultaneously.",
                    task_concurrency_limit_);
@@ -156,71 +162,64 @@ ExecutionEngine::GetMaximumTasks() const {
   }
 }
 
-// TODO(luobogao): We don't want to use `root` to execute command. Switch to
-// `nobody` before running the command.
-//
 // TODO(luobogao): In case we've just killed a lot of child, wait until they've
 // fully exited (i.e., **freed memory**) before starting new job. Otherwise we
 // risk OOM-ing the machine.
-std::optional<std::uint64_t> ExecutionEngine::TryQueueCommandForExecution(
-    std::uint64_t grant_id, const std::string& command, Input input) {
-  auto task_id = next_task_id_++;
-
-  // Let's see if there's enough resource for us to start a new child.
-  if (running_tasks_.fetch_add(1, std::memory_order_relaxed) + 1 >
-      task_concurrency_limit_) {
-    FLARE_LOG_WARNING_EVERY_SECOND(
-        "Actively rejecting task [{}]. We've running out of available "
-        "processors.",
-        grant_id);
-    running_tasks_.fetch_sub(1, std::memory_order_relaxed);
-    // `task_id` is wasted. This doesn't matter.
-    return {};
-  }
-
-  if (GetMemoryAvailable() < min_memory_for_starting_new_task_) {
-    FLARE_LOG_WARNING_EVERY_SECOND(
-        "Actively rejecting task [{}]. We've running out of available memory.",
-        grant_id);
-    running_tasks_.fetch_sub(1, std::memory_order_relaxed);
-    return {};
-  }
-
+std::optional<std::uint64_t> ExecutionEngine::TryQueueTask(
+    std::uint64_t grant_id, flare::RefPtr<ExecutionTask> user_task) {
   std::scoped_lock _(tasks_lock_);
-  if (exiting_.load(std::memory_order_relaxed)) {
-    // Well we're leaving.
+
+  auto task_id = TryStartingNewTaskUnsafe();
+  if (!task_id) {
     return {};
   }
 
-  FLARE_VLOG(1, "Executing: [{}]", command);
-  tasks_run_ever_.fetch_add(1, std::memory_order_relaxed);
+  auto cmd = user_task->GetCommandLine();
+  FLARE_VLOG(1, "Executing: [{}]", cmd);
 
   // Save the task state. The caller will be polling on the execution result
   // later (if the task takes sufficiently long.).
-  auto&& task = tasks_[task_id];
+  auto&& task = tasks_[*task_id];
+  task = flare::MakeRefCounted<TaskDesc>();
+
+  // Prepare stdin / stdout / stderr.
+  TemporaryFile temp_in(GetTemporaryDir());
+  temp_in.Write(user_task->GetStandardInputOnce());
+  task->stdout_file.emplace(GetTemporaryDir());
+  task->stderr_file.emplace(GetTemporaryDir());
 
   // FIXME: Program started with lock held. Starting program can be slow.
-  auto pid = StartProgram(command, kDefaultNiceLevel, input.standard_input.fd(),
-                          input.standard_output.fd(), input.standard_error.fd(),
+  auto pid = StartProgram(cmd, kDefaultNiceLevel, temp_in.fd(),
+                          task->stdout_file->fd(), task->stderr_file->fd(),
                           true /* Isolated process group. */);
-  task = flare::MakeRefCounted<TaskDesc>();
   task->grant_id = grant_id;  // Well we don't check for duplicate here, it
                               // won't hurt us.
+  task->client_ref_count = 1;
+  // TODO(luobogao): Enable it (preferably unconditionally).
+  task->limit_cpu = false;
   task->started_at = flare::ReadSteadyClock();
-  task->command = command;
   task->process_id = pid;
-  task->output.context = input.context;  // Pass it back to the caller later.
-  task->input = std::move(input);
-  task->input->standard_input.Close();  // Signals EOF to the child.
+  task->task = std::move(user_task);
+  task->exposition_only.command = cmd;
 
   // Wake up pid waiter.
   waitpid_semaphore_.release();
   return task_id;
 }
 
-flare::Expected<ExecutionEngine::Output, ExecutionStatus>
-ExecutionEngine::WaitForCompletion(std::uint64_t task_id,
-                                   std::chrono::nanoseconds timeout) {
+bool ExecutionEngine::TryReferenceTask(std::uint64_t task_id) {
+  std::scoped_lock _(tasks_lock_);
+  auto task = tasks_.find(task_id);
+  if (task == tasks_.end()) {
+    return false;
+  }
+  ++task->second->client_ref_count;
+  return true;
+}
+
+flare::Expected<flare::RefPtr<ExecutionTask>, ExecutionStatus>
+ExecutionEngine::WaitForTask(std::uint64_t task_id,
+                             std::chrono::nanoseconds timeout) {
   flare::RefPtr<TaskDesc> task;
   {
     std::scoped_lock _(tasks_lock_);
@@ -235,51 +234,62 @@ ExecutionEngine::WaitForCompletion(std::uint64_t task_id,
   if (!task->completion_latch.wait_for(timeout)) {
     return ExecutionStatus::Running;
   }
-  return task->output;  // Keep it there in case we're called again (e.g. due to
-                        // RPC retry.).
+  // Keep it there in case we're called again (e.g. due to RPC retry.).
+  return task->task;
 }
 
 void ExecutionEngine::FreeTask(std::uint64_t task_id) {
-  // If it's alive, kill it.
-  //
-  // This is unlikely, but if the user does call us before its job finishes,
-  // let's be correct at least.
-  KillTask(task_id);
+  flare::RefPtr<TaskDesc> task_free;
+  {
+    std::scoped_lock _(tasks_lock_);
+    auto task = tasks_.find(task_id);
 
-  std::scoped_lock _(tasks_lock_);
-  // This can fail, if the cleanup timer came before us.
-  (void)tasks_.erase(task_id);
+    if (task == tasks_.end()) {
+      return;
+    }
+
+    // If more than one client wait for this task, we should only dereference
+    // the task.
+    if (--task->second->client_ref_count > 0) {
+      return;
+    }
+
+    // No other client wait on the task, clean it.
+    task_free = task->second;
+    (void)tasks_.erase(task);
+  }
+
+  // If it's alive, kill it.
+  KillTask(task_free.Get());
 }
 
-std::vector<std::uint64_t> ExecutionEngine::EnumerateGrantOfRunningTask() {
-  std::vector<std::uint64_t> result;
+std::vector<ExecutionEngine::Task> ExecutionEngine::EnumerateTasks() const {
+  std::vector<Task> result;
   std::scoped_lock _(tasks_lock_);
   for (auto&& [k, v] : tasks_) {
-    result.push_back(v->grant_id);
+    if (v->task) {
+      result.emplace_back(Task{k, v->grant_id, v->task});
+    }
   }
   return result;
 }
 
 void ExecutionEngine::KillExpiredTasks(
     const std::unordered_set<std::uint64_t>& expired_grant_ids) {
-  std::vector<std::uint64_t> task_ids;
-
+  auto killed = 0;
   {
     std::scoped_lock _(tasks_lock_);
     for (auto&& [k, v] : tasks_) {
       if (v->is_running.load(std::memory_order_relaxed) &&
           expired_grant_ids.count(v->grant_id) != 0) {
-        task_ids.push_back(k);  // You're done.
+        KillTask(v.Get());
+        ++killed;
       }
     }
   }
-  for (auto&& e : task_ids) {
-    KillTask(e);
-  }
 
-  FLARE_LOG_WARNING_IF(!task_ids.empty(),
-                       "Killed {} tasks that are reported as expired.",
-                       task_ids.size());
+  FLARE_LOG_WARNING_IF(killed > 0,
+                       "Killed {} tasks that are reported as expired.", killed);
 }
 
 void ExecutionEngine::Stop() {
@@ -288,31 +298,20 @@ void ExecutionEngine::Stop() {
   flare::fiber::KillTimer(cleanup_timer_);
 
   // Kill all pending tasks then.
-  std::vector<std::uint64_t> pending_tasks;
   {
     std::scoped_lock _(tasks_lock_);
     for (auto&& [k, v] : tasks_) {
-      pending_tasks.push_back(k);
+      KillTask(v.Get());
     }
   }
-  for (auto e : pending_tasks) {
-    KillTask(e);
-  }
 
-  waitpid_semaphore_.release();  // On extra `release` to wake up our
+  waitpid_semaphore_.release();  // One extra `release` to wake up our
                                  // sub-process waiter (if it's sleeping.).
 }
 
-void ExecutionEngine::KillTask(std::uint64_t task_id) {
-  flare::RefPtr<TaskDesc> task;
-  {
-    std::scoped_lock _(tasks_lock_);
-    if (auto iter = tasks_.find(task_id); iter != tasks_.end()) {
-      task = iter->second;
-    }
-    // No we don't remove task from `tasks_` now, it's our child-exit callback's
-    // job.
-  }
+void ExecutionEngine::KillTask(TaskDesc* task) {
+  // No we don't remove task from `tasks_` now, it's our child-exit callback's
+  // job.
   if (task && task->is_running.load(std::memory_order_relaxed)) {
     // Forcibly kill the task then.
     //
@@ -342,6 +341,35 @@ void ExecutionEngine::Join() {
       break;
     }
   }
+}
+
+std::optional<std::uint64_t> ExecutionEngine::TryStartingNewTaskUnsafe() {
+  if (exiting_.load(std::memory_order_relaxed)) {
+    // Well we're leaving.
+    return std::nullopt;
+  }
+
+  auto task_id = next_task_id_++;
+
+  // Let's see if there's enough resource for us to start a new child.
+  if (running_tasks_.fetch_add(1, std::memory_order_relaxed) + 1 >
+      task_concurrency_limit_) {
+    FLARE_LOG_WARNING_EVERY_SECOND(
+        "Actively rejecting task. We've running out of available processors.");
+    running_tasks_.fetch_sub(1, std::memory_order_relaxed);
+    // `task_id` is wasted. This doesn't matter.
+    return std::nullopt;
+  }
+
+  if (GetMemoryAvailable() < min_memory_for_starting_new_task_) {
+    FLARE_LOG_WARNING_EVERY_SECOND(
+        "Actively rejecting task. We've running out of available memory.");
+    running_tasks_.fetch_sub(1, std::memory_order_relaxed);
+    return std::nullopt;
+  }
+
+  tasks_run_ever_.fetch_add(1, std::memory_order_relaxed);
+  return task_id;
 }
 
 void ExecutionEngine::OnCleanupTimer() {
@@ -392,23 +420,19 @@ void ExecutionEngine::OnProcessExitCallback(pid_t pid, int exit_code) {
     return;  // Ignore it then.
   }
 
-  FLARE_LOG_WARNING_IF_EVERY_SECOND(
-      exit_code == -1, "Command [{}] failed unexpectedly.", task->command);
-
-  auto&& input = *task->input;
-  auto&& output = task->output;
-
-  // Read the outputs and free `input`.
-  output.exit_code = exit_code;
-  output.standard_output = input.standard_output.ReadAll();
-  output.standard_error = input.standard_error.ReadAll();
-  task->input = std::nullopt;
+  FLARE_LOG_WARNING_IF_EVERY_SECOND(exit_code == -1,
+                                    "Command [{}] failed unexpectedly.",
+                                    task->exposition_only.command);
 
   // Mark the task as finished.
   task->completed_at = flare::ReadCoarseSteadyClock();
   task->is_running.store(false, std::memory_order_relaxed);
 
-  lk.unlock();  // Unlocked before waking up waiters.
+  auto out = task->stdout_file->ReadAll(), err = task->stderr_file->ReadAll();
+  // Hopefully unlock prior calling user's callback won't hurt.
+  lk.unlock();
+  task->task->OnCompletion(exit_code, std::move(out), std::move(err));
+
   task->completion_latch.count_down();
 }
 
@@ -458,7 +482,8 @@ Json::Value ExecutionEngine::DumpTasks() {
       tasks_run_ever_.load(std::memory_order_relaxed));
   for (auto&& [k, v] : tasks_) {
     auto&& e = jsv[std::to_string(k)];
-    e["command"] = v->command;
+    e = v->task->DumpInternals();
+    e["command"] = v->exposition_only.command;
     if (v->is_running.load(std::memory_order_relaxed)) {
       e["state"] = "RUNNING";
     } else {
@@ -467,11 +492,11 @@ Json::Value ExecutionEngine::DumpTasks() {
           v->completed_at - flare::ReadSteadyClock() + flare::ReadSystemClock();
       e["completed_at"] = static_cast<Json::UInt64>(
           std::chrono::system_clock::to_time_t(sys_time));
-      e["exit_code"] = v->output.exit_code;
+      e["exit_code"] = v->exposition_only.exit_code;
       e["stdout_size"] =
-          static_cast<Json::UInt64>(v->output.standard_output.ByteSize());
+          static_cast<Json::UInt64>(v->exposition_only.stdout_size);
       e["stderr_size"] =
-          static_cast<Json::UInt64>(v->output.standard_error.ByteSize());
+          static_cast<Json::UInt64>(v->exposition_only.stderr_size);
     }
   }
   return jsv;

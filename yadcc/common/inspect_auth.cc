@@ -16,7 +16,7 @@
 
 #include <string_view>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/string.h"
 #include "flare/rpc/builtin/basic_authentication_http_filter.h"

@@ -15,6 +15,8 @@
 #ifndef YADCC_COMMON_IO_H_
 #define YADCC_COMMON_IO_H_
 
+#include <string>
+
 #include "flare/base/buffer.h"
 
 // Same as `flare/client/io.h` except here we deal with noncontiguous buffer
@@ -39,6 +41,12 @@ ReadStatus ReadAppend(int fd, flare::NoncontiguousBufferBuilder* to);
 //
 // Returns: bytes written.
 std::ptrdiff_t WriteTo(int fd, const flare::NoncontiguousBuffer& data);
+
+// Read from `path`.
+flare::NoncontiguousBuffer ReadAll(const std::string& path);
+
+// Write file to path.
+void WriteAll(const std::string& path, const flare::NoncontiguousBuffer& data);
 
 }  // namespace yadcc
 

@@ -14,11 +14,15 @@
 
 #include "yadcc/common/io.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/types.h>
 #include <unistd.h>
 
+#include "flare/base/handle.h"
 #include "flare/base/logging.h"
+#include "flare/base/string.h"
 
 namespace yadcc {
 
@@ -70,6 +74,20 @@ std::ptrdiff_t WriteTo(int fd, const flare::NoncontiguousBuffer& bytes) {
     bytes_written += bytes;
   }
   return bytes_written;
+}
+
+flare::NoncontiguousBuffer ReadAll(const std::string& path) {
+  flare::Handle fd(open(path.c_str(), O_RDONLY));
+  FLARE_PCHECK(fd, "Can't open file [{}]", path);
+  flare::NoncontiguousBufferBuilder builder;
+  FLARE_PCHECK(ReadAppend(fd.Get(), &builder) == ReadStatus::Eof);
+  return builder.DestructiveGet();
+}
+
+void WriteAll(const std::string& path, const flare::NoncontiguousBuffer& data) {
+  flare::Handle fd(open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+  FLARE_PCHECK(fd, "Can't open file [{}]", path);
+  FLARE_PCHECK(WriteTo(fd.Get(), data) == data.ByteSize());
 }
 
 }  // namespace yadcc

@@ -17,8 +17,8 @@
 #include <chrono>
 #include <string>
 
-#include "thirdparty/gflags/gflags.h"
-#include "thirdparty/openssl/rand.h"
+#include "gflags/gflags.h"
+#include "openssl/rand.h"
 
 #include "flare/base/chrono.h"
 #include "flare/base/compression.h"
@@ -27,6 +27,7 @@
 #include "flare/rpc/logging.h"
 #include "flare/rpc/rpc_server_controller.h"
 
+#include "yadcc/common/token_verifier.h"
 #include "yadcc/scheduler/task_dispatcher.h"
 
 using namespace std::literals;
@@ -55,6 +56,9 @@ SchedulerServiceImpl::SchedulerServiceImpl() {
   active_serving_daemon_tokens_ = {NextServingDaemonToken(),
                                    NextServingDaemonToken(),
                                    NextServingDaemonToken()};
+  is_user_verifier_ = MakeTokenVerifierFromFlag(FLAGS_acceptable_user_tokens);
+  is_servant_verifier_ =
+      MakeTokenVerifierFromFlag(FLAGS_acceptable_servant_tokens);
   next_serving_daemon_token_rollout_ =
       flare::ReadCoarseSteadyClock() +
       FLAGS_serving_daemon_token_rollout_interval * 1s;
@@ -66,7 +70,8 @@ void SchedulerServiceImpl::Heartbeat(const HeartbeatRequest& request,
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
   // Verify the requestor first.
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token()) &&
+      !is_servant_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
@@ -136,7 +141,8 @@ void SchedulerServiceImpl::Heartbeat(const HeartbeatRequest& request,
     servant.priority = SERVANT_PRIORITY_USER;
   }
   servant.max_tasks = request.capacity();
-  servant.not_accepting_task_reason = request.not_accepting_task_reason();
+  servant.not_accepting_task_reason =
+      static_cast<NotAcceptingTaskReason>(request.not_accepting_task_reason());
   if (observed_location != reported_location) {
     // It's likely the servant is behind NAT.
     //
@@ -144,6 +150,10 @@ void SchedulerServiceImpl::Heartbeat(const HeartbeatRequest& request,
     // reachable from outside. So don't assign tasks to them.
     servant.max_tasks = 0;
     servant.not_accepting_task_reason = NOT_ACCEPTING_TASK_REASON_BEHIND_NAT;
+  }
+  if (!is_servant_verifier_->Verify(request.token())) {
+    servant.max_tasks = 0;
+    servant.not_accepting_task_reason = NOT_ACCEPTING_TASK_REASON_NOT_VERIFIED;
   }
   for (auto&& e : request.env_descs()) {
     servant.environments.push_back(e);
@@ -167,9 +177,10 @@ void SchedulerServiceImpl::Heartbeat(const HeartbeatRequest& request,
 
   // Sent back the task the daemon should be running on. Any tasks not listed
   // here will likely be killed by the daemon.
-  for (auto&& e : TaskDispatcher::Instance()->ExamineRunningTasks(
-           request.location(),
-           {request.running_tasks().begin(), request.running_tasks().end()})) {
+  auto expired_task = TaskDispatcher::Instance()->NotifyServantRunningTasks(
+      request.location(),
+      {request.running_tasks().begin(), request.running_tasks().end()});
+  for (auto&& e : expired_task) {
     response->add_expired_tasks(e);
   }
 
@@ -188,7 +199,7 @@ void SchedulerServiceImpl::GetConfig(const GetConfigRequest& request,
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
   // Verify the requestor first.
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
@@ -202,7 +213,7 @@ void SchedulerServiceImpl::WaitForStartingTask(
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
   // Verify the requestor first.
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
@@ -216,26 +227,34 @@ void SchedulerServiceImpl::WaitForStartingTask(
 
   TaskPersonality task;
   task.requestor_ip = flare::EndpointGetIp(controller->GetRemotePeer());
+  task.min_version = request.min_version();
   task.env_desc = request.env_desc();
 
+  auto now = flare::ReadCoarseSteadyClock();
   for (int i = 0; i != request.immediate_reqs(); ++i) {
     auto result = TaskDispatcher::Instance()->WaitForStartingNewTask(
         task, next_keep_alive,
         // Note that we can't wait except for the first task. If we wait for too
         // long for the remaining tasks, the first task may have already been
         // expired before we even return.
-        i == 0 ? max_wait : 0s, false);
+        now + (i == 0 ? max_wait : 0s), false);
     if (!result) {
+      if (result.error() == WaitStatus::EnvironmentNotFound) {
+        controller->SetFailed(STATUS_ENVIRONMENT_NOT_AVAILABLE,
+                              "No matched servant environment.");
+        return;
+      }
       break;
     }
     auto&& added = response->add_grants();
     added->set_task_grant_id(result->task_id);
     added->set_servant_location(result->servant_location);
   }
+
   for (int i = 0; i != request.prefetch_reqs(); ++i) {
     auto result = TaskDispatcher::Instance()->WaitForStartingNewTask(
-        task, next_keep_alive, response->grants().empty() ? max_wait : 0s,
-        true);
+        task, next_keep_alive,
+        now + (response->grants().empty() ? max_wait : 0s), true);
     if (!result) {
       break;
     }
@@ -257,7 +276,7 @@ void SchedulerServiceImpl::KeepTaskAlive(
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
   // Verify the requestor first.
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
@@ -280,13 +299,21 @@ void SchedulerServiceImpl::FreeTask(const FreeTaskRequest& request,
   flare::AddLoggingItemToRpc(controller->GetRemotePeer().ToString());
 
   // Verify the requestor first.
-  if (!token_verifier_->Verify(request.token())) {
+  if (!is_user_verifier_->Verify(request.token())) {
     controller->SetFailed(STATUS_ACCESS_DENIED);
     return;
   }
 
   for (auto&& e : request.task_grant_ids()) {
     TaskDispatcher::Instance()->FreeTask(e);
+  }
+}
+
+void SchedulerServiceImpl::GetRunningTasks(
+    const GetRunningTasksRequest& request, GetRunningTasksResponse* response,
+    flare::RpcServerController* controller) {
+  for (auto&& running_task : TaskDispatcher::Instance()->GetRunningTasks()) {
+    *response->add_running_tasks() = std::move(running_task);
   }
 }
 

@@ -18,9 +18,11 @@ cc_library(
   srcs = 'io.cc',
   deps = [
     '//flare/base:buffer',
+    '//flare/base:handle',
     '//flare/base:logging',
+    '//flare/base:string',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_test(
@@ -32,13 +34,33 @@ cc_test(
 )
 
 cc_library(
+  name = 'dir',
+  hdrs = 'dir.h',
+  srcs = 'dir.cc',
+  deps = [
+    '//flare/base:logging',
+    '//flare/base:string',
+  ],
+  visibility = '//yadcc/...',
+)
+
+cc_test(
+  name = 'dir_test',
+  srcs = 'dir_test.cc',
+  deps = [
+    ':dir',
+    '//flare/base:logging',
+  ]
+)
+
+cc_library(
   name = 'xxhash',
   hdrs = 'xxhash.h',
   srcs = 'xxhash.cc',
   deps = [
     '//thirdparty/xxhash:xxhash',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_test(
@@ -59,7 +81,7 @@ cc_library(
     '//flare/base:string',
     '//thirdparty/gflags:gflags',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_test(
@@ -77,10 +99,11 @@ cc_library(
   srcs = 'inspect_auth.cc',
   deps = [
     '//flare/base:string',
+    '//flare/rpc:http',
     '//flare/rpc/builtin:basic_authentication_http_filter',
     '//thirdparty/gflags:gflags',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_test(
@@ -103,7 +126,7 @@ cc_library(
     '//flare/base:logging',
     '//flare/base:string',
   ],
-  visibility = 'PUBLIC',
+  visibility = '//yadcc/...',
 )
 
 cc_test(
@@ -111,5 +134,59 @@ cc_test(
   srcs = 'parse_size_test.cc',
   deps = [
     ':parse_size',
+  ]
+)
+
+cc_library(
+  name = 'disk_cache',
+  hdrs = 'disk_cache.h',
+  srcs = 'disk_cache.cc',
+  deps = [
+    ':consistent_hash',
+    ':dir',
+    ':io',
+    ':parse_size',
+    ':xxhash',
+    '//flare/base:buffer',
+    '//flare/base:encoding',
+    '//flare/base:handle',
+    '//flare/base:string',
+    '//flare/base/crypto:blake3',
+    '//thirdparty/jsoncpp:jsoncpp',
+  ],
+  visibility = '//yadcc/...',
+)
+
+cc_test(
+  name = 'disk_cache_test',
+  srcs = 'disk_cache_test.cc',
+  deps = [
+    ':dir',
+    ':disk_cache',
+    '//flare/base:random',
+    '//flare/base:string',
+    '//flare/init:override_flag',
+    '//thirdparty/gflags:gflags',
+  ]
+)
+
+cc_library(
+  name = 'consistent_hash',
+  hdrs = 'consistent_hash.h',
+  srcs = 'consistent_hash.cc',
+  deps = [
+    '//flare/base:logging',
+    '//flare/base:string',
+  ],
+  visibility = '//yadcc/...',
+)
+
+cc_test(
+  name = 'consistent_hash_test',
+  srcs = 'consistent_hash_test.cc',
+  deps = [
+    ':consistent_hash',
+    ':xxhash',
+    '//flare/base:random',
   ]
 )

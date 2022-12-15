@@ -14,6 +14,10 @@
 
 syntax = "proto3";
 
+import "google/protobuf/any.proto";
+
+import "yadcc/api/patch.proto";
+
 package yadcc.daemon;
 
 // Defines some meta data about a compilation cache. For the compilation result
@@ -29,11 +33,16 @@ message CacheMeta {
   bytes standard_output = 1;
   bytes standard_error = 2;
 
+  // Depending on source code language, this field may contain some extra meta
+  // information (e.g., C++ compilation cache use this field for source-path
+  // patch locations.).
+  google.protobuf.Any extra_info = 6;
+
   // BLAKE3 of object file. This helps us to detect data corruption on network
   // (or bug in our cache server implementation.).
   //
   // I'm not sure if we should use a cryptographical hash algorithm here. Given
   // that the digest is used only to detect non-malicious data corruption, a
   // cryptograhical hash algorithm may be a overkill?
-  bytes object_file_digest = 4;
+  bytes files_digest = 4;
 }

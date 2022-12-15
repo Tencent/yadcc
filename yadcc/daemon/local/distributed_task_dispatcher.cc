@@ -23,12 +23,13 @@
 #include <chrono>
 #include <cinttypes>
 #include <optional>
-#include <unordered_map>
+#include <string>
 #include <utility>
 #include <vector>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
+#include "flare/base/buffer/packing.h"
 #include "flare/base/enum.h"
 #include "flare/base/internal/time_view.h"
 #include "flare/base/never_destroyed.h"
@@ -38,10 +39,10 @@
 #include "flare/fiber/timer.h"
 #include "flare/rpc/rpc_client_controller.h"
 
-#include "yadcc/api/daemon.flare.pb.h"
+#include "yadcc/api/daemon.pb.h"
 #include "yadcc/daemon/cache_format.h"
 #include "yadcc/daemon/common_flags.h"
-#include "yadcc/daemon/local/distributed_cache_reader.h"
+#include "yadcc/daemon/local/config_keeper.h"
 
 using namespace std::literals;
 
@@ -102,20 +103,37 @@ DistributedTaskDispatcher::DistributedTaskDispatcher()
   config_keeper_.Start();
 }
 
-DistributedTaskDispatcher::~DistributedTaskDispatcher() {
+DistributedTaskDispatcher::~DistributedTaskDispatcher() {}
+
+void DistributedTaskDispatcher::Stop() {
   flare::fiber::KillTimer(abort_timer_);
   flare::fiber::KillTimer(keep_alive_timer_);
+  flare::fiber::KillTimer(kill_orphan_timer_);
   flare::fiber::KillTimer(cleanup_timer_);
+
+  task_grant_keeper_.Stop();
+  config_keeper_.Stop();
+  running_task_keeper_.Stop();
 }
 
-std::uint64_t DistributedTaskDispatcher::QueueTask(
-    CompilationTask task,
+void DistributedTaskDispatcher::Join() {
+  task_grant_keeper_.Join();
+  config_keeper_.Join();
+  running_task_keeper_.Join();
+
+  // FIXME: We should wait until all outstanding operations finish (e.g., fibers
+  // for performing task).
+}
+
+std::uint64_t DistributedTaskDispatcher::QueueDistributedTask(
+    flare::TypeIndex type, std::unique_ptr<DistributedTask> task,
     std::chrono::steady_clock::time_point start_deadline) {
   auto task_id = NextTaskId();
   auto desc = flare::MakeRefCounted<TaskDesc>();
   desc->task_id = task_id;
+  desc->task_type = type;
   desc->state = TaskState::Pending;
-  desc->task = task;
+  desc->task = std::move(task);
   desc->start_deadline = start_deadline;
   desc->started_at = flare::ReadCoarseSteadyClock();
 
@@ -129,13 +147,26 @@ std::uint64_t DistributedTaskDispatcher::QueueTask(
   return desc->task_id;
 }
 
-DistributedTaskDispatcher::WaitStatus DistributedTaskDispatcher::WaitForTask(
-    std::uint64_t task_id, std::chrono::nanoseconds timeout,
-    CompilationOutput* output) {
+flare::Expected<std::unique_ptr<DistributedTask>,
+                DistributedTaskDispatcher::WaitStatus>
+DistributedTaskDispatcher::WaitForDistributedTask(
+    flare::TypeIndex type, std::uint64_t task_id,
+    std::chrono::nanoseconds timeout) {
   flare::RefPtr<TaskDesc> desc;
   {
     std::scoped_lock _(tasks_lock_);
     if (auto iter = tasks_.find(task_id); iter != tasks_.end()) {
+      if (iter->second->task_type != type) {  // Unlikely.
+        FLARE_LOG_ERROR_EVERY_SECOND(
+            "Unexpected: Mismatching task type. Requesting [{}], found [{}]. "
+            "This is likely a bug in our client.",
+            flare::Demangle(type.GetRuntimeTypeIndex().name()),
+            flare::Demangle(
+                iter->second->task_type.GetRuntimeTypeIndex().name()));
+        // Given that our `task_id` is unique by itself, there won't be a second
+        // match. Fail the call.
+        return WaitStatus::NotFound;
+      }
       desc = iter->second;
     }
   }
@@ -147,31 +178,18 @@ DistributedTaskDispatcher::WaitStatus DistributedTaskDispatcher::WaitForTask(
   }
 
   {
-    std::scoped_lock _(desc->lock);
-    *output = desc->output;
-  }
-
-  // On success, forget about the task.
-  {
     std::scoped_lock _(tasks_lock_);
+    // On success, forget about the task.
+    //
     // Note that this can fail, if `OnCleanupTimer` removes the task before we
     // grab the task lock.
+    //
+    // Don't worry about `desc`, it keeps a reference to the task.
     (void)tasks_.erase(task_id);
   }
-  return WaitStatus::OK;
-}
 
-void DistributedTaskDispatcher::Stop() {
-  task_grant_keeper_.Stop();
-  config_keeper_.Stop();
-}
-
-void DistributedTaskDispatcher::Join() {
-  task_grant_keeper_.Join();
-  config_keeper_.Join();
-
-  // FIXME: We should wait until all outstanding operations finish (e.g., fibers
-  // for performing task).
+  std::scoped_lock _(desc->lock);
+  return std::move(desc->task);
 }
 
 // TODO(luobogao): What about error handling? Or should we ask the client itself
@@ -189,6 +207,7 @@ void DistributedTaskDispatcher::PerformOneTask(flare::RefPtr<TaskDesc> task) {
   // Mark the task as completed and wake up waiter (if any) on leave.
   flare::ScopedDeferred _([&] {
     std::scoped_lock _(task->lock);
+    task->task->OnCompletion(task->output);
     task->state = TaskState::Done;  // `OnCleanupTimer` will take care of this
                                     // task if no one else would.
     task->completed_at = flare::ReadCoarseSteadyClock();
@@ -198,32 +217,102 @@ void DistributedTaskDispatcher::PerformOneTask(flare::RefPtr<TaskDesc> task) {
   });
 
   // Let's see if the cache can satisfy our task.
-  auto cache_entry =
-      task->task.cache_control == CacheControl::Allow
-          ? DistributedCacheReader::Instance()->TryRead(GetCacheEntryKey(
-                task->task.env_desc, task->task.invocation_arguments,
-                task->task.source_digest))
-          : std::nullopt;
-  if (cache_entry) {  // Our lucky day.
-    task->output =
-        CompilationOutput{.exit_code = 0,
-                          .standard_output = cache_entry->standard_output,
-                          .standard_error = cache_entry->standard_error,
-                          // FIXME: Decompression.
-                          .object_file = cache_entry->object_file};
+  if (TryReadCacheIfAllowed(task.Get())) {
+    hit_cache_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
+  // Try to reuse same started task result.
+  if (TryGetExistingTaskResult(task.Get())) {
+    reuse_existing_result_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  // Start a new servant task.
+  StartNewServantTask(task.Get());
+  actually_run_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool DistributedTaskDispatcher::TryReadCacheIfAllowed(TaskDesc* task) {
+  auto cache_entry = task->task->GetCacheSetting() == CacheControl::Allow
+                         ? DistributedCacheReader::Instance()->TryRead(
+                               task->task->GetCacheKey())
+                         : std::nullopt;
+  if (cache_entry) {  // Our lucky day.
+    auto&& files = TryParseFiles(cache_entry->files);
+    if (files) {
+      task->output =
+          DistributedTaskOutput{.exit_code = 0,
+                                .standard_output = cache_entry->standard_output,
+                                .standard_error = cache_entry->standard_error,
+                                .extra_info = cache_entry->extra_info,
+                                .output_files = std::move(*files)};
+      return true;
+    }
+  }
+  return false;
+}
+
+bool DistributedTaskDispatcher::TryGetExistingTaskResult(TaskDesc* task) {
+  auto running_task = running_task_keeper_.TryFindTask(task->task->GetDigest());
+  if (!running_task) {
+    return false;
+  }
+
+  cloud::DaemonService_SyncStub stub(
+      FLAGS_debugging_always_use_servant_at.empty()
+          ? flare::Format("flare://{}", running_task->servant_location)
+          : FLAGS_debugging_always_use_servant_at);
+  cloud::ReferenceTaskRequest req;
+  req.set_token(config_keeper_.GetServingDaemonToken());
+  req.set_task_id(running_task->servant_task_id);
+
+  flare::RpcClientController ctlr;
+  auto result = stub.ReferenceTask(req, &ctlr);
+
+  // We reference the running task. Because of the delay problem, there is a
+  // certain chance that it will fail.
+  if (!result) {
+    FLARE_LOG_WARNING_EVERY_SECOND("Failed to reference task: {}",
+                                   result.error().ToString());
+    return false;
+  }
+  if (ctlr.ErrorCode() == cloud::STATUS_TASK_NOT_FOUND) {
+    FLARE_LOG_WARNING_EVERY_SECOND("Referenced task not found.");
+    return false;
+  }
+
+  flare::ScopedDeferred ___([&] { FreeServantTask(task->task_id, &stub); });
+  {
+    std::scoped_lock _(task->lock);  // For updating task state.
+
+    task->ready_at = flare::ReadCoarseSteadyClock();
+    task->last_keep_alive_at = flare::ReadCoarseSteadyClock();
+    task->task_grant_id = 0;
+    task->servant_location = running_task->servant_location;
+    task->dispatched_at = flare::ReadCoarseSteadyClock();
+    task->state = TaskState::Dispatched;
+    task->servant_task_id = running_task->servant_task_id;
+  }
+
+  WaitServantForTaskWithRetry(task, &stub);
+  return true;
+}
+
+void DistributedTaskDispatcher::StartNewServantTask(TaskDesc* task) {
   // Wait until we can dispatch the task.
-  std::optional<GrantDesc> task_grant;
+  std::optional<TaskGrantKeeper::GrantDesc> task_grant;
   while (!task_grant && !task->aborted.load(std::memory_order_relaxed)) {
-    task_grant = task_grant_keeper_.Get(task->task.env_desc, 1s);
+    task_grant = task_grant_keeper_.Get(task->task->GetEnvironmentDesc(), 1s);
   }
   if (!task_grant) {
     FLARE_LOG_ERROR("Task {} cannot be started in time. Aborted.",
                     task->task_id);
     return;
   }
+
+  FLARE_VLOG(1, "Dispatching task to servant [{}].",
+             task_grant->servant_location);
   {
     std::scoped_lock _(task->lock);  // For updating task state.
 
@@ -250,8 +339,8 @@ void DistributedTaskDispatcher::PerformOneTask(flare::RefPtr<TaskDesc> task) {
           : FLAGS_debugging_always_use_servant_at);
 
   // Now dispatch the task.
-  auto servant_task_id =
-      SubmitTaskToServant(task_grant->grant_id, *task, &stub);
+  auto servant_task_id = task->task->StartTask(
+      config_keeper_.GetServingDaemonToken(), task_grant->grant_id, &stub);
   if (!servant_task_id) {
     FLARE_LOG_ERROR("Failed to submit task {} to servant [{}]: {}",
                     task->task_id, task_grant->servant_location,
@@ -269,24 +358,19 @@ void DistributedTaskDispatcher::PerformOneTask(flare::RefPtr<TaskDesc> task) {
     task->servant_task_id = *servant_task_id;
   }
 
-  flare::ScopedDeferred ___([&] {
-    // Now we can free the task info kept by the remote daemon.
-    //
-    // TODO(luobogao): Move this out of the critical path to speed things up.
-    // Perhaps we can use a free-task queue to do this asynchronously.
-    cloud::FreeTaskRequest req;
-    flare::RpcClientController ctlr;
-    req.set_token(config_keeper_.GetServingDaemonToken());
-    req.set_task_id(*servant_task_id);
-    (void)stub.FreeTask(req, &ctlr);  // Failure is ignored.
-  });
+  flare::ScopedDeferred ___([&] { FreeServantTask(*servant_task_id, &stub); });
+  WaitServantForTaskWithRetry(task, &stub);
+}
 
+void DistributedTaskDispatcher::WaitServantForTaskWithRetry(
+    TaskDesc* task, cloud::DaemonService_SyncStub* from) {
   // We tolerance at most so many **successive** wait failure.
   constexpr auto kRpcRetries = 4;  // Timeout is 3s, up to 120s.
+
   // Wait until the task completes.
   std::size_t retries_left = kRpcRetries;
   while (retries_left-- && !task->aborted.load(std::memory_order_relaxed)) {
-    auto wait_result = WaitServantForTask(*servant_task_id, &stub);
+    auto wait_result = WaitServantForTask(task->servant_task_id, from);
     if (!wait_result) {
       if (wait_result.error() == ServantWaitStatus::Running) {
         // Not an error, actually.
@@ -298,19 +382,19 @@ void DistributedTaskDispatcher::PerformOneTask(flare::RefPtr<TaskDesc> task) {
           FLARE_LOG_WARNING_EVERY_SECOND(
               "RPC failure in waiting for task {} running on [{}]. {} retries "
               "left.",
-              task->task_id, task_grant->servant_location, retries_left);
+              task->task_id, task->servant_location, retries_left);
         } else {
           FLARE_LOG_ERROR(
               "RPC failure in waiting for task {} running on [{}]. Bailing "
               "out.",
-              task->task_id, task_grant->servant_location);
+              task->task_id, task->servant_location);
         }
         flare::this_fiber::SleepFor(1s);  // Relax.
         continue;
       } else if (wait_result.error() == ServantWaitStatus::Failed) {
         // Permanent error then.
         FLARE_LOG_ERROR("Failed to wait on task {} running on [{}].",
-                        task->task_id, task_grant->servant_location);
+                        task->task_id, task->servant_location);
         std::scoped_lock _(task->lock);
         task->output.exit_code = -125;  // FIXME: Use constant instead.
         break;
@@ -324,61 +408,26 @@ void DistributedTaskDispatcher::PerformOneTask(flare::RefPtr<TaskDesc> task) {
     if (wait_result->exit_code == 127) {
       FLARE_LOG_WARNING_EVERY_SECOND(
           "Failed to start compiler on servant [{}]: {}",
-          task_grant->servant_location, wait_result->standard_error);
+          task->servant_location, wait_result->standard_error);
       // Fall-through.
     }
 
     // Life is good.
     std::scoped_lock _(task->lock);
     task->output = *wait_result;
-    // TODO(luobaogao): We can immediately wake up waiter (if any) by now.
+    // TODO(luobogao): We can immediately wake up waiter (if any) by now.
     break;
   }
 }
 
-flare::Expected<std::uint64_t, flare::Status>
-DistributedTaskDispatcher::SubmitTaskToServant(
-    std::uint64_t grant_id, const TaskDesc& task,
-    cloud::DaemonService_SyncStub* to) {
-  cloud::QueueCompilationTaskRequest req;
-  req.set_token(config_keeper_.GetServingDaemonToken());
-  req.set_task_grant_id(grant_id);
-  *req.mutable_env_desc() = task.task.env_desc;
-  req.set_source_path(task.task.source_path);
-  req.set_invocation_arguments(task.task.invocation_arguments);
-  req.set_compression_algorithm(cloud::COMPRESSION_ALGORITHM_ZSTD);
-  req.set_disallow_cache_fill(task.task.cache_control ==
-                              CacheControl::Disallow);
-
-  flare::RpcClientController ctlr;
-  // This can take long if servant is in a DC that locates in a district
-  // different than us.
-  ctlr.SetTimeout(30s);
-  ctlr.SetRequestAttachment(task.task.preprocessed_source);
-  // FIXME: `preprocessed_source` can be freed as soon as we finished submitting
-  // it.
-
-  auto result = to->QueueCompilationTask(req, &ctlr);
-  if (!result) {
-    FLARE_LOG_WARNING("Rpc failed after {} seconds.",
-                      ctlr.GetElapsedTime() / 1s);
-    return result.error();
-  }
-  // For the moment we don't support returning "DONE" on submission.
-  if (result->status() != cloud::COMPILATION_TASK_STATUS_RUNNING) {
-    FLARE_LOG_ERROR_EVERY_SECOND("Unexpected task status [{}] from servant.",
-                                 result->status());
-    return flare::Status{-1, "Unexpected task status from servant."};
-  }
-  return result->task_id();
-}
-
-flare::Expected<CompilationOutput, DistributedTaskDispatcher::ServantWaitStatus>
+flare::Expected<DistributedTaskOutput,
+                DistributedTaskDispatcher::ServantWaitStatus>
 DistributedTaskDispatcher::WaitServantForTask(
     std::uint64_t servant_task_id, cloud::DaemonService_SyncStub* from) {
   flare::RpcClientController ctlr;
 
   cloud::WaitForCompilationOutputRequest req;
+  req.set_version(version_for_upgrade);
   req.set_token(config_keeper_.GetServingDaemonToken());
   req.set_task_id(servant_task_id);
   req.set_milliseconds_to_wait(2s / 1ms);
@@ -402,12 +451,33 @@ DistributedTaskDispatcher::WaitServantForTask(
   FLARE_CHECK_EQ(result->status(), cloud::COMPILATION_TASK_STATUS_DONE);
 
   // The task has finished (either successfully or with and error.).
-  return CompilationOutput{
-      .exit_code = result->exit_code(),
-      .standard_output = result->output(),
-      .standard_error = result->error(),
-      .object_file = ctlr.GetResponseAttachment(),
-  };
+  DistributedTaskOutput output = {.exit_code = result->exit_code(),
+                                  .standard_output = result->output(),
+                                  .standard_error = result->error(),
+                                  .extra_info = result->extra_info()};
+  if (output.exit_code == 0) {
+    // Files are available only if the the source file is compiled successfully.
+    auto&& files = TryParseFiles(ctlr.GetResponseAttachment());
+    if (!files) {
+      FLARE_LOG_ERROR_EVERY_SECOND("Failed to parse the files from servant.");
+      return ServantWaitStatus::Failed;
+    }
+    output.output_files = std::move(*files);
+  }
+  return output;
+}
+
+void DistributedTaskDispatcher::FreeServantTask(
+    std::uint64_t servant_task_id, cloud::DaemonService_SyncStub* from) {
+  // Now we can free the task info kept by the remote daemon.
+  //
+  // TODO(luobogao): Move this out of the critical path to speed things up.
+  // Perhaps we can use a free-task queue to do this asynchronously.
+  cloud::FreeTaskRequest req;
+  flare::RpcClientController ctlr;
+  req.set_token(config_keeper_.GetServingDaemonToken());
+  req.set_task_id(servant_task_id);
+  (void)from->FreeTask(req, &ctlr);  // Failure is ignored.
 }
 
 Json::Value DistributedTaskDispatcher::DumpInternals() {
@@ -422,6 +492,14 @@ Json::Value DistributedTaskDispatcher::DumpInternals() {
   std::scoped_lock _(tasks_lock_);
   Json::Value jsv;
 
+  auto&& statistics = jsv["statistics"];
+  statistics["hit_cache"] =
+      static_cast<Json::UInt64>(hit_cache_.load(std::memory_order_relaxed));
+  statistics["reuse_existing_result"] = static_cast<Json::UInt64>(
+      reuse_existing_result_.load(std::memory_order_relaxed));
+  statistics["actually_run"] =
+      static_cast<Json::UInt64>(actually_run_.load(std::memory_order_relaxed));
+
   for (auto&& [k, v] : tasks_) {
     std::scoped_lock _(v->lock);
 
@@ -429,16 +507,8 @@ Json::Value DistributedTaskDispatcher::DumpInternals() {
     auto&& entry = jsv[dir][std::to_string(k)];
 
     // Common parts first.
+    entry = v->task->Dump();
     entry["state"] = state;
-    entry["requestor_pid"] = static_cast<Json::UInt64>(v->task.requestor_pid);
-    entry["source_digest"] = v->task.source_digest;
-    entry["compiler_digest"] = v->task.env_desc.compiler_digest();
-    entry["source_path"] = v->task.source_path;
-    entry["invocation_arguments"] = v->task.invocation_arguments;
-    // TODO(luobogao): Write our own hacky `EnumerationToName(...)` and use it.
-    entry["cache_control"] = static_cast<int>(v->task.cache_control);
-    entry["preprocessed_source_size"] =
-        static_cast<Json::UInt64>(v->task.preprocessed_source.ByteSize());
     entry["task_grant_id"] = static_cast<Json::UInt64>(v->task_grant_id);
 
     switch (v->state) {
@@ -449,8 +519,13 @@ Json::Value DistributedTaskDispatcher::DumpInternals() {
             static_cast<Json::UInt64>(v->output.standard_output.size());
         entry["stderr_size"] =
             static_cast<Json::UInt64>(v->output.standard_error.size());
-        entry["object_file_size"] =
-            static_cast<Json::UInt64>(v->output.object_file.ByteSize());
+
+        {
+          auto&& outputs = entry["outputs"];
+          for (auto&& [suffix, file] : v->output.output_files) {
+            outputs[suffix] = static_cast<Json::UInt64>(file.ByteSize());
+          }
+        }
         [[fallthrough]];
 
       case TaskState::Dispatched:
@@ -574,7 +649,7 @@ void DistributedTaskDispatcher::OnKillOrphanTimer() {
     std::scoped_lock _(tasks_lock_);
     for (auto&& [_, v] : tasks_) {
       if (!v->aborted.load(std::memory_order_relaxed) &&
-          !IsProcessAlive(v->task.requestor_pid)) {
+          !IsProcessAlive(v->task->GetInvokerPid())) {
         // `PerformOneTask` will abort the task as soon as it sees this flag.
         v->aborted.store(true, std::memory_order_relaxed);
         ++aborted;
@@ -630,187 +705,18 @@ void DistributedTaskDispatcher::OnCleanupTimer() {
   // `destroying` destroyed.
 }
 
-DistributedTaskDispatcher::TaskGrantKeeper::TaskGrantKeeper()
-    : scheduler_stub_(FLAGS_scheduler_uri) {}
-
-std::optional<DistributedTaskDispatcher::GrantDesc>
-DistributedTaskDispatcher::TaskGrantKeeper::Get(
-    const EnvironmentDesc& desc, const std::chrono::nanoseconds& timeout) {
-  PerEnvGrantKeeper* keeper;
-  {
-    std::scoped_lock _(lock_);
-    auto&& e = keepers_[desc.compiler_digest()];
-    if (!e) {
-      e = std::make_unique<PerEnvGrantKeeper>();
-      e->env_desc = desc;
-      e->fetcher =
-          flare::Fiber([this, env = e.get()] { GrantFetcherProc(env); });
-    }
-    keeper = e.get();
+std::optional<std::vector<std::pair<std::string, flare::NoncontiguousBuffer>>>
+DistributedTaskDispatcher::TryParseFiles(
+    const flare::NoncontiguousBuffer& bytes) {
+  auto files_with_suffix = TryParseKeyedNoncontiguousBuffers(bytes);
+  if (!files_with_suffix) {
+    return std::nullopt;
   }
-
-  std::unique_lock lk(keeper->lock);
-  // Drop expired grants first.
-  while (!keeper->remaining.empty() &&
-         // We don't compensate for network delay here. We've already done that
-         // in `GrantFetcherProc`.
-         keeper->remaining.front().expires_at <
-             flare::ReadCoarseSteadyClock()) {
-    keeper->remaining.pop();
+  std::vector<std::pair<std::string, flare::NoncontiguousBuffer>> result;
+  for (auto&& [suffix, buf] : *files_with_suffix) {
+    result.emplace_back(std::move(suffix), std::move(buf));
   }
-
-  // We still have some. Satisfied without incur an RPC.
-  if (!keeper->remaining.empty()) {
-    auto result = keeper->remaining.front();
-    keeper->remaining.pop();
-    return result;
-  }
-
-  ++keeper->waiters;
-  flare::ScopedDeferred _([&] { FLARE_CHECK_GE(--keeper->waiters, 0); });
-
-  keeper->need_more_cv.notify_all();
-  if (!keeper->available_cv.wait_for(
-          lk, timeout, [&] { return !keeper->remaining.empty(); })) {
-    return {};
-  }
-  auto result = keeper->remaining.front();
-  keeper->remaining.pop();
   return result;
-}
-
-void DistributedTaskDispatcher::TaskGrantKeeper::Free(std::uint64_t grant_id) {
-  struct Context {
-    scheduler::FreeTaskRequest req;
-    flare::RpcClientController ctlr;
-  };
-
-  auto ctx = std::make_shared<Context>();
-  ctx->req.set_token(FLAGS_token);
-  ctx->req.add_task_grant_ids(grant_id);
-  ctx->ctlr.SetTimeout(5s);
-
-  // Done asynchronously, the result is discard. Failure doesn't harm.
-  scheduler_stub_.FreeTask(ctx->req, &ctx->ctlr)
-      .Then([ctx = ctx, grant_id](auto result) {
-        FLARE_LOG_WARNING_IF(
-            !result, "Failed to free task grant [{}]. Ignoring", grant_id);
-      });
-}
-
-void DistributedTaskDispatcher::TaskGrantKeeper::Stop() {
-  std::scoped_lock _(lock_);
-  leaving_.store(true, std::memory_order_relaxed);
-  for (auto&& [_, v] : keepers_) {
-    v->need_more_cv.notify_all();
-  }
-}
-
-void DistributedTaskDispatcher::TaskGrantKeeper::Join() {
-  // Locking should not be necessary here as not one else could have been able
-  // to add new elements to the map once `Stop()` finishes.
-  for (auto&& [_, v] : keepers_) {
-    v->fetcher.join();
-  }
-}
-
-void DistributedTaskDispatcher::TaskGrantKeeper::GrantFetcherProc(
-    PerEnvGrantKeeper* keeper) {
-  constexpr auto kMaxWait = 5s;
-  // Tolerance of possible network delay.
-  constexpr auto kNetworkDelayTolerance = 5s;
-  constexpr auto kExpiresIn = 15s;
-
-  static_assert(kExpiresIn > kMaxWait + kNetworkDelayTolerance + 1s,
-                "Otherwise the grant can possibly expire immediately after RPC "
-                "finishes..");
-
-  while (!leaving_.load(std::memory_order_relaxed)) {
-    std::unique_lock lk(keeper->lock);
-    keeper->need_more_cv.wait(lk, [&] {
-      return leaving_.load(std::memory_order_relaxed) ||
-             keeper->remaining.empty();
-    });
-    if (leaving_.load(std::memory_order_relaxed)) {
-      break;
-    }
-
-    auto before_rpc_now = flare::ReadCoarseSteadyClock();
-    scheduler::WaitForStartingTaskRequest req;
-    flare::RpcClientController ctlr;
-
-    req.set_token(FLAGS_token);
-    req.set_milliseconds_to_wait(kMaxWait / 1ms);
-    req.set_next_keep_alive_in_ms(kExpiresIn / 1ms);
-    *req.mutable_env_desc() = keeper->env_desc;
-    req.set_immediate_reqs(keeper->waiters);
-    req.set_prefetch_reqs(1);
-    ctlr.SetTimeout(kMaxWait + 5s);
-
-    // We don't want to hold lock during RPC.
-    lk.unlock();
-    auto result = flare::fiber::BlockingGet(
-        scheduler_stub_.WaitForStartingTask(req, &ctlr));
-    lk.lock();
-    if (result) {
-      // Per method definition the scheduler is not required to wait until all
-      // desired grants are available. Instead, the scheduler is permitted to
-      // satisfy part of our requests. So don't assume the size of the result
-      // array.
-      for (int i = 0; i != result->grants().size(); ++i) {
-        keeper->remaining.push(GrantDesc{
-            // Using timestamp prior to RPC issue, let's be conservative.
-            .expires_at = before_rpc_now + kExpiresIn - kNetworkDelayTolerance,
-            .grant_id = result->grants(i).task_grant_id(),
-            .servant_location = result->grants(i).servant_location()});
-      }
-      keeper->available_cv.notify_all();
-    } else {
-      if (result.error().code() != scheduler::STATUS_NO_QUOTA_AVAILABLE ||
-          req.immediate_reqs()) {
-        FLARE_LOG_WARNING("Failed to acquire grant for starting new task: {}",
-                          result.error().ToString());
-      } else {
-        FLARE_VLOG(1,
-                   "Unable to prefetch grant for possible new-coming task. The "
-                   "cloud is busy.");
-      }
-      // Sleep for a while before retry if we fail.
-      flare::this_fiber::SleepFor(100ms);
-      // Retry then, hopefully now we fetched more grants to start new tasks.
-    }
-  }
-}
-
-DistributedTaskDispatcher::ConfigKeeper::ConfigKeeper()
-    : scheduler_stub_(FLAGS_scheduler_uri) {}
-
-void DistributedTaskDispatcher::ConfigKeeper::Start() {
-  OnFetchConfig();
-  config_fetcher_ = flare::fiber::SetTimer(10s, [this] { OnFetchConfig(); });
-}
-
-void DistributedTaskDispatcher::ConfigKeeper::Stop() {
-  flare::fiber::KillTimer(config_fetcher_);
-}
-
-void DistributedTaskDispatcher::ConfigKeeper::Join() {
-  // NOTHING.
-}
-
-void DistributedTaskDispatcher::ConfigKeeper::OnFetchConfig() {
-  scheduler::GetConfigRequest req;
-  req.set_token(FLAGS_token);
-
-  flare::RpcClientController ctlr;
-  auto result = scheduler_stub_.GetConfig(req, &ctlr);
-  if (!result) {
-    FLARE_LOG_WARNING("Failed to fetch config from scheduler.");
-    return;
-  }
-
-  std::scoped_lock _(lock_);
-  serving_daemon_token_ = result->serving_daemon_token();
 }
 
 }  // namespace yadcc::daemon::local

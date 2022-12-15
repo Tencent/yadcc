@@ -27,7 +27,7 @@
 #include <sstream>
 #include <string>
 
-#include "thirdparty/gflags/gflags.h"
+#include "gflags/gflags.h"
 
 #include "flare/base/internal/cpu.h"
 #include "flare/base/never_destroyed.h"

@@ -14,8 +14,8 @@
 
 #include "yadcc/common/xxhash.h"
 
-#include "thirdparty/googletest/gtest/gtest.h"
-#include "thirdparty/xxhash/xxhash.h"
+#include "gtest/gtest.h"
+#include "xxhash/xxhash.h"
 
 using namespace std::literals;
 

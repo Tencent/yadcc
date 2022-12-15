@@ -15,17 +15,20 @@
 #include "yadcc/daemon/local/distributed_task_dispatcher.h"
 
 #include <chrono>
+#include <utility>
+#include <vector>
 
-#include "thirdparty/googletest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
+#include "flare/base/buffer/packing.h"
 #include "flare/fiber/this_fiber.h"
 #include "flare/init/override_flag.h"
 #include "flare/testing/main.h"
-#include "flare/testing/redis_mock.h"
 #include "flare/testing/rpc_mock.h"
 
-#include "yadcc/api/daemon.flare.pb.h"
-#include "yadcc/api/scheduler.flare.pb.h"
+#include "yadcc/api/daemon.pb.h"
+#include "yadcc/api/scheduler.pb.h"
+#include "yadcc/daemon/task_digest.h"
 
 FLARE_OVERRIDE_FLAG(scheduler_uri, "mock://whatever-it-wants-to-be");
 FLARE_OVERRIDE_FLAG(cache_server_uri, "mock://whatever-it-wants-to-be");
@@ -35,6 +38,42 @@ using namespace std::literals;
 
 namespace yadcc::daemon::local {
 
+namespace {
+
+class TestingTask : public DistributedTask {
+ public:
+  pid_t GetInvokerPid() const override { return pid; }
+
+  CacheControl GetCacheSetting() const override {
+    return CacheControl::Disallow;
+  }
+  std::string GetCacheKey() const override { return cache_key; }
+  std::string GetDigest() const override { return digest; }
+  const EnvironmentDesc& GetEnvironmentDesc() const override {
+    static const EnvironmentDesc env;
+    return env;
+  }
+
+  flare::Expected<std::uint64_t, flare::Status> StartTask(
+      const std::string& token, std::uint64_t grant_id,
+      cloud::DaemonService_SyncStub* stub) override {
+    return 10;
+  }
+  void OnCompletion(const DistributedTaskOutput& output) override {
+    this->output = output;
+  }
+
+  Json::Value Dump() const override { return {}; }
+
+  pid_t pid;
+  std::string cache_key;
+  std::string digest;
+
+  DistributedTaskOutput output;
+};
+
+}  // namespace
+
 scheduler::WaitForStartingTaskResponse MakeWaitForTaskResponse(int grant_id) {
   scheduler::WaitForStartingTaskResponse result;
   auto ptr = result.add_grants();
@@ -43,18 +82,20 @@ scheduler::WaitForStartingTaskResponse MakeWaitForTaskResponse(int grant_id) {
   return result;
 }
 
-daemon::cloud::QueueCompilationTaskResponse MakeQueueCompilationTaskResponse(
-    int task_id) {
-  daemon::cloud::QueueCompilationTaskResponse resp;
-  resp.set_status(daemon::cloud::COMPILATION_TASK_STATUS_RUNNING);
-  resp.set_task_id(10);
-  return resp;
-}
-
 EnvironmentDesc MakeEnvironmentDesc(const std::string& s) {
   EnvironmentDesc desc;
   desc.set_compiler_digest(s);
   return desc;
+}
+
+scheduler::GetRunningTasksResponse MakeGetRunningTasksResponse() {
+  scheduler::GetRunningTasksResponse resp;
+  auto running_task = resp.add_running_tasks();
+  running_task->set_task_grant_id(78787878);
+  running_task->set_servant_task_id(88888888);
+  running_task->set_servant_location("repeated servant location");
+  running_task->set_task_digest("digest2");
+  return resp;
 }
 
 std::atomic<int> keep_alives{};
@@ -73,24 +114,54 @@ void WaitForCompilationOutputHandler(
     daemon::cloud::WaitForCompilationOutputResponse* resp,
     flare::RpcServerController* ctlr) {
   static int counter = 0;
-
-  if (++counter == 1) {  // The first call times out.
-    flare::this_fiber::SleepFor(2s);
-    resp->set_status(daemon::cloud::COMPILATION_TASK_STATUS_RUNNING);
-  } else {  // The second one succeeds.
+  if (req.task_id() == 88888888) {
     resp->set_status(daemon::cloud::COMPILATION_TASK_STATUS_DONE);
     resp->set_exit_code(0);
-    ctlr->SetResponseAttachment(flare::CreateBufferSlow("my output"));
+
+    std::vector<std::pair<std::string, flare::NoncontiguousBuffer>>
+        file_with_suffix{
+            {".o", flare::CreateBufferSlow("my repeated output")},
+            {".gcno", flare::CreateBufferSlow("my repeated gcno")}};
+    ctlr->SetResponseAttachment(
+        WriteKeyedNoncontiguousBuffers(file_with_suffix));
+  } else {
+    if (++counter == 1) {  // The first call times out.
+      flare::this_fiber::SleepFor(2s);
+      resp->set_status(daemon::cloud::COMPILATION_TASK_STATUS_RUNNING);
+    } else {  // The second one succeeds.
+      resp->set_status(daemon::cloud::COMPILATION_TASK_STATUS_DONE);
+      resp->set_exit_code(0);
+
+      std::vector<std::pair<std::string, flare::NoncontiguousBuffer>>
+          file_with_suffix{{".o", flare::CreateBufferSlow("my output")},
+                           {".gcno", flare::CreateBufferSlow("my gcno")}};
+      ctlr->SetResponseAttachment(
+          WriteKeyedNoncontiguousBuffers(file_with_suffix));
+    }
   }
 }
 
-TEST(DistributedTaskDispatcher, All) {
-  ///////////////////////////////////////////////////
-  // Mocking cache server, we simply let it fail.  //
-  ///////////////////////////////////////////////////
-  FLARE_EXPECT_REDIS_COMMAND(::testing::_)
-      .WillRepeatedly(flare::testing::Return(flare::RedisError{"ERR", "msg"}));
+void WaitForCompilationOutputCompilationFailureHandler(
+    const daemon::cloud::WaitForCompilationOutputRequest& req,
+    daemon::cloud::WaitForCompilationOutputResponse* resp,
+    flare::RpcServerController* ctlr) {
+  resp->set_status(daemon::cloud::COMPILATION_TASK_STATUS_DONE);
+  resp->set_exit_code(12);
+  resp->set_output("output");
+  resp->set_error("error");
+}
 
+std::unique_ptr<TestingTask> MakeTestingTask(pid_t pid,
+                                             const std::string& task_digest,
+                                             const std::string& cache_key) {
+  auto result = std::make_unique<TestingTask>();
+  result->pid = pid;
+  result->digest = task_digest;
+  result->cache_key = cache_key;
+  return result;
+}
+
+TEST(DistributedTaskDispatcher, All) {
   ///////////////////////////////////
   // Mocking scheduler's methods.  //
   ///////////////////////////////////
@@ -109,54 +180,103 @@ TEST(DistributedTaskDispatcher, All) {
           [&](auto&&, scheduler::GetConfigResponse* resp, auto&&) {
             resp->set_serving_daemon_token("123");
           }));
+  FLARE_EXPECT_RPC(scheduler::SchedulerService::GetRunningTasks, ::testing::_)
+      .WillRepeatedly(flare::testing::Return(MakeGetRunningTasksResponse()));
 
   /////////////////////////////////
   // Mocking servant's methods.  //
   /////////////////////////////////
 
-  FLARE_EXPECT_RPC(daemon::cloud::DaemonService::QueueCompilationTask,
-                   ::testing::_)
-      .WillRepeatedly(
-          flare::testing::Return(MakeQueueCompilationTaskResponse(1)));
   FLARE_EXPECT_RPC(daemon::cloud::DaemonService::WaitForCompilationOutput,
                    ::testing::_)
-      .WillRepeatedly(
-          flare::testing::HandleRpc(WaitForCompilationOutputHandler));
+      .WillOnce(flare::testing::HandleRpc(WaitForCompilationOutputHandler))
+      .WillOnce(flare::testing::HandleRpc(WaitForCompilationOutputHandler))
+      .WillOnce(flare::testing::HandleRpc(WaitForCompilationOutputHandler))
+      .WillRepeatedly(flare::testing::HandleRpc(
+          WaitForCompilationOutputCompilationFailureHandler));
   FLARE_EXPECT_RPC(daemon::cloud::DaemonService::FreeTask, ::testing::_)
       .WillRepeatedly(
           flare::testing::Return(daemon::cloud::FreeTaskResponse()));
+  FLARE_EXPECT_RPC(daemon::cloud::DaemonService::ReferenceTask, ::testing::_)
+      .WillRepeatedly(
+          flare::testing::Return(daemon::cloud::ReferenceTaskResponse()));
 
   //////////////////////
   // UT starts here.  //
   //////////////////////
 
-  auto task_id = DistributedTaskDispatcher::Instance()->QueueTask(
-      CompilationTask{.requestor_pid = 1,
-                      .env_desc = MakeEnvironmentDesc("compiler-env"),
-                      .source_digest = "cache key digest",
-                      .preprocessed_source = flare::CreateBufferSlow("buffer")},
-      flare::ReadCoarseSteadyClock() + 100s);
+  // A successful compilation task.
 
-  CompilationOutput compilation_output;
-  ASSERT_EQ(DistributedTaskDispatcher::WaitStatus::Timeout,
-            DistributedTaskDispatcher::Instance()->WaitForTask(
-                task_id, 1s, &compilation_output));
+  {
+    auto task_id = DistributedTaskDispatcher::Instance()->QueueTask(
+        MakeTestingTask(1, "digest1", "cachekey1"),
+        flare::ReadCoarseSteadyClock() + 100s);
 
-  // @sa: First expectation on `WaitForCompilationOutput`.
-  std::this_thread::sleep_for(3s);
-  ASSERT_EQ(DistributedTaskDispatcher::WaitStatus::OK,
-            DistributedTaskDispatcher::Instance()->WaitForTask(
-                task_id, 1s, &compilation_output));
-  EXPECT_EQ(0, compilation_output.exit_code);
-  EXPECT_EQ("my output", flare::FlattenSlow(compilation_output.object_file));
+    ASSERT_EQ(DistributedTaskDispatcher::WaitStatus::Timeout,
+              DistributedTaskDispatcher::Instance()
+                  ->WaitForTask<TestingTask>(task_id, 1s)
+                  .error());
 
-  // The task is dropped on first successful wait.
-  ASSERT_EQ(DistributedTaskDispatcher::WaitStatus::NotFound,
-            DistributedTaskDispatcher::Instance()->WaitForTask(
-                task_id, 1s, &compilation_output));
+    // @sa: First expectation on `WaitForCompilationOutput`.
+    std::this_thread::sleep_for(3s);
+    auto wait_result =
+        DistributedTaskDispatcher::Instance()->WaitForTask<TestingTask>(task_id,
+                                                                        1s);
+    ASSERT_TRUE(wait_result);
+    auto&& compilation_output =
+        static_cast<TestingTask*>(wait_result->get())->output;
+    EXPECT_EQ(0, compilation_output.exit_code);
+    EXPECT_EQ("my output",
+              flare::FlattenSlow(compilation_output.output_files[0].second));
+    EXPECT_EQ("my gcno",
+              flare::FlattenSlow(compilation_output.output_files[1].second));
+    // The task is dropped on first successful wait.
+    ASSERT_EQ(DistributedTaskDispatcher::WaitStatus::NotFound,
+              DistributedTaskDispatcher::Instance()
+                  ->WaitForTask<TestingTask>(task_id, 1s)
+                  .error());
+  }
 
-  EXPECT_GT(keep_alives, 1);
-  EXPECT_EQ(1, freed_tasks);
+  // A repeated compilation task.
+  {
+    auto task_id = DistributedTaskDispatcher::Instance()->QueueTask(
+        MakeTestingTask(1, "digest2", "cachekey2"),
+        flare::ReadCoarseSteadyClock() + 100s);
+
+    auto wait_result =
+        DistributedTaskDispatcher::Instance()->WaitForTask<TestingTask>(task_id,
+                                                                        1s);
+    auto&& compilation_output =
+        static_cast<TestingTask*>(wait_result->get())->output;
+    EXPECT_EQ(0, compilation_output.exit_code);
+    EXPECT_EQ("my repeated output",
+              flare::FlattenSlow(compilation_output.output_files[0].second));
+    EXPECT_EQ("my repeated gcno",
+              flare::FlattenSlow(compilation_output.output_files[1].second));
+    // The task is dropped on first successful wait.
+    ASSERT_EQ(DistributedTaskDispatcher::WaitStatus::NotFound,
+              DistributedTaskDispatcher::Instance()
+                  ->WaitForTask<TestingTask>(task_id, 1s)
+                  .error());
+    EXPECT_GT(keep_alives, 1);
+  }
+
+  // A failed compilation task.
+  {
+    auto task_id = DistributedTaskDispatcher::Instance()->QueueTask(
+        MakeTestingTask(1, "digest3", "cachekey3"),
+        flare::ReadCoarseSteadyClock() + 100s);
+
+    auto wait_result =
+        DistributedTaskDispatcher::Instance()->WaitForTask<TestingTask>(task_id,
+                                                                        1s);
+    auto&& compilation_output =
+        static_cast<TestingTask*>(wait_result->get())->output;
+
+    EXPECT_EQ(12, compilation_output.exit_code);
+    EXPECT_EQ("output", compilation_output.standard_output);
+    EXPECT_EQ("error", compilation_output.standard_error);
+  }
 }
 
 }  // namespace yadcc::daemon::local

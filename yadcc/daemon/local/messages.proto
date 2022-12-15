@@ -14,10 +14,9 @@
 
 syntax = "proto3";
 
-package yadcc.daemon.local;
+import "yadcc/api/patch.proto";
 
-// Messages here are used to serialize request (as JSON) for calling our HTTP
-// interfaces. @sa: `README.md`
+package yadcc.daemon.local;
 
 message GetVersionRequest {
   // NOTHING.
@@ -25,6 +24,15 @@ message GetVersionRequest {
 
 message GetVersionResponse {
   string built_at = 1;
+  uint32 version_for_upgrade = 2;  // @sa: `daemon/common_flags.h`
+}
+
+message AskToLeaveRequest {
+  // NOTHING.
+}
+
+message AskToLeaveResponse {
+  // NOTHING.
 }
 
 message AcquireQuotaRequest {
@@ -61,23 +69,88 @@ message ReleaseQuotaResponse {
   // Nothing. Check out HTTP status code for operation result.
 }
 
-// Not used. See `README.md` for more details.
-message SubmitTaskRequest {}
-
-message SubmitTaskResponse {
-  string task_id = 1;
+// This message uses several easy-to-get attributes to describe a file.
+message FileDesc {
+  string path = 1;
+  uint64 size = 2;
+  uint64 timestamp = 3;
 }
 
-message WaitForTaskRequest {
-  string task_id = 1;
+// Report file digest to local daemon.
+//
+// In certain cases the daemon may need file digest of some file (e.g.,
+// compiler's). Because daemon can be possibly run under different user of the
+// client, the daemon may or may not have access to the compiler. Therefore, we
+// ask the client to calculate the compiler's digest and report it to the
+// daemon.
+message SetFileDigestRequest {
+  FileDesc file_desc = 1;
+  string digest = 2;  // Usually is a BLAKE3 hash, hex encoded.
+}
+
+message SetFileDigestResponse {
+  // NOTHING.
+}
+
+message SubmitCxxTaskRequest {
+  int32 requestor_process_id = 1;
+  string source_path = 2;
+  string source_digest = 3;
+  string compiler_invocation_arguments = 4;
+  int32 cache_control = 5;
+  FileDesc compiler = 6;
+}
+
+message SubmitCxxTaskResponse {
+  uint64 task_id = 1;  // Encoded as string in JSON.
+}
+
+message WaitForCxxTaskRequest {
+  uint64 task_id = 1;  // Encoded as string in JSON.
   uint32 milliseconds_to_wait = 2;
 }
 
-message WaitForTaskResponse {
+message WaitForCxxTaskResponse {
   int32 exit_code = 1;
   string output = 2;  // stdout
   string error = 3;   // stderr
+  repeated string file_extensions = 4;
+  repeated yadcc.patch.Locations patches = 5;
 }
 
-// No `service` is required here, see `README.md` for how to use this
-// IDL file.
+service HttpService {
+  // GET /local/get_version
+  //
+  // This method returns version of the running daemon.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
+  // POST /local/ask_to_leave
+  //
+  // The daemon kills itself on reception of this message.
+  rpc AskToLeave(AskToLeaveRequest) returns (AskToLeaveResponse);
+
+  // POST /local/acquire_quota
+  //
+  // Acquire a quota for starting a new child.
+  rpc AcquireQuota(AcquireQuotaRequest) returns (AcquireQuotaResponse);
+
+  // POST /local/release_quota
+  //
+  // Release quota previously granted.
+  rpc ReleaseQuota(ReleaseQuotaRequest) returns (ReleaseQuotaResponse);
+
+  // POST /local/set_file_digest
+  //
+  // Tell the daemon about BLAKE3 digest of an on-disk file.
+  rpc SetFileDigest(SetFileDigestRequest) returns (SetFileDigestResponse);
+
+  // POST /local/submit_cxx_task
+  //
+  // Submit a C++ compilation task.
+  rpc SubmitCxxTask(SubmitCxxTaskRequest) returns (SubmitCxxTaskResponse);
+
+  // POST /local/wait_for_cxx_task
+  //
+  // Wait for a previously-submitted C++ task to complete.
+  rpc WaitForCxxTask(WaitForCxxTaskRequest) returns (WaitForCxxTaskResponse);
+}

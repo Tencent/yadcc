@@ -12,25 +12,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-cc_library(
-  name = 'dir',
-  hdrs = 'dir.h',
-  srcs = 'dir.cc',
-  deps = [
-    '//flare/base:logging',
-    '//flare/base:string',
-  ]
-)
-
-cc_test(
-  name = 'dir_test',
-  srcs = 'dir_test.cc',
-  deps = [
-    ':dir',
-    '//flare/base:logging',
-  ]
-)
-
 cc_test(
   name = 'bloom_filter_generator_test',
   srcs = 'bloom_filter_generator_test.cc',
@@ -60,6 +41,7 @@ cc_library(
     ':cache_engine',
     ':in_memory_cache',
     '//flare/base:compression',
+    '//flare/base:exposed_var',
     '//flare/base:random',
     '//flare/base:string',
     '//flare/fiber:fiber',
@@ -84,26 +66,6 @@ cc_test(
     '//flare/testing:main',
     '//flare/testing:rpc_controller',
     '//yadcc/api:cache_proto_flare',
-  ]
-)
-
-cc_library(
-  name = 'consistent_hash',
-  hdrs = 'consistent_hash.h',
-  srcs = 'consistent_hash.cc',
-  deps = [
-    '//flare/base:logging',
-    '//flare/base:string',
-  ]
-)
-
-cc_test(
-  name = 'consistent_hash_test',
-  srcs = 'consistent_hash_test.cc',
-  deps = [
-    ':consistent_hash',
-    '//flare/base:random',
-    '//yadcc/common:xxhash',
   ]
 )
 
@@ -133,8 +95,7 @@ cc_library(
   srcs = 'cache_engine.cc',
   deps = [
     '//flare/base:buffer',
-    '//flare/base:dependency_registry',
-    '//thirdparty/jsoncpp:jsoncpp',
+    '//flare/base:dependency_registry'
   ]
 )
 
@@ -145,6 +106,7 @@ cc_library(
   deps = [
     ':cache_engine',
     '//flare/base:buffer',
+    '//thirdparty/jsoncpp:jsoncpp',
   ],
   link_all_symbols = True
 )
@@ -155,16 +117,7 @@ cc_library(
   srcs = 'disk_cache_engine.cc',
   deps = [
     ':cache_engine',
-    ':consistent_hash',
-    ':dir',
-    '//flare/base:buffer',
-    '//flare/base:encoding',
-    '//flare/base:handle',
-    '//flare/base:string',
-    '//flare/base/crypto:blake3',
-    '//thirdparty/jsoncpp:jsoncpp',
-    '//yadcc/common:io',
-    '//yadcc/common:xxhash',
+    '//yadcc/common:disk_cache',
   ],
   link_all_symbols = True
 )
@@ -173,12 +126,49 @@ cc_test(
   name = 'disk_cache_engine_test',
   srcs = 'disk_cache_engine_test.cc',
   deps = [
-    ':dir',
     ':disk_cache_engine',
     '//flare/base:random',
-    '//flare/base:string',
     '//flare/init:override_flag',
     '//thirdparty/gflags:gflags',
+    '//yadcc/common:dir',
+  ]
+)
+
+cc_library(
+  name = 'cos_cache_engine',
+  hdrs = 'cos_cache_engine.h',
+  srcs = 'cos_cache_engine.cc',
+  deps = [
+    ':cache_engine',
+    '//flare/base:buffer',
+    '//flare/base:string',
+    '//flare/fiber:fiber',
+    '//flare/net/cos:cos_client',
+    '//flare/net/cos/ops/bucket:get_bucket',
+    '//flare/net/cos/ops/object:delete_multiple_objects',
+    '//flare/net/cos/ops/object:get_object',
+    '//flare/net/cos/ops/object:put_object',
+    '//thirdparty/gflags:gflags',
+    '//yadcc/common:parse_size',
+    '//yadcc/common:xxhash',
+  ],
+  link_all_symbols = True
+)
+
+cc_test(
+  name = 'cos_cache_engine_test',
+  srcs = 'cos_cache_engine_test.cc',
+  deps = [
+    ':cos_cache_engine',
+    '//flare/base:never_destroyed',
+    '//flare/base:random',
+    '//flare/init:override_flag',
+    '//flare/net/cos:cos_status',
+    '//flare/net/cos/ops/bucket:get_bucket',
+    '//flare/net/cos/ops/object:get_object',
+    '//flare/net/cos/ops/object:put_object',
+    '//flare/testing:cos_mock',
+    '//flare/testing:main',
   ]
 )
 
@@ -187,6 +177,7 @@ cc_binary(
   srcs = 'entry.cc',
   deps = [
     ':cache_service_impl',
+    ':cos_cache_engine',
     ':disk_cache_engine',
     ':null_cache_engine',
     '//flare:init',
