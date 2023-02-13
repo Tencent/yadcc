@@ -57,7 +57,7 @@ class TestingTask : public DistributedTask {
   flare::Expected<std::uint64_t, flare::Status> StartTask(
       const std::string& token, std::uint64_t grant_id,
       cloud::DaemonService_SyncStub* stub) override {
-    return 10;
+    return static_cast<std::uint64_t>(10);
   }
   void OnCompletion(const DistributedTaskOutput& output) override {
     this->output = output;
