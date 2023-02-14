@@ -4,13 +4,13 @@
 
 编译完成后，至少需要启动如下服务：
 
-- 需要一台用于调度任务的机器，并运行`yadcc/scheduler/yadcc-scheduler`。具体使用可以参考[调度器文档](scheduler.md)。如：`./yadcc-scheduler --acceptable_tokens=some_fancy_token`。
+- 需要一台用于调度任务的机器，并运行`yadcc/scheduler/yadcc-scheduler`。具体使用可以参考[调度器文档](scheduler.md)。如：`./yadcc-scheduler --acceptable_user_tokens=some_fancy_token --acceptable_servant_tokens=some_fancy_token`。
 
   *尽管生产环境中不推荐，测试时调度机可以和编译机、用户机位于同一台机器。*
 
 为了加速编译（用户**之间**互相共享编译结果），还可以启动如下服务：
 
-- 缓存服务器上运行`yadcc/cache/yadcc-cache`。具体使用可以参考[缓存服务器文档](cache.md)。如：`./yadcc-cache --acceptable_tokens=some_fancy_token`。
+- 缓存服务器上运行`yadcc/cache/yadcc-cache`。具体使用可以参考[缓存服务器文档](cache.md)。如：`./yadcc-cache --acceptable_user_tokens=some_fancy_token --acceptable_servant_tokens=some_fancy_token`。
 
   *尽管生产环境中不推荐，测试时缓存服务器可以和调度器、编译机、用户机位于同一台机器。*
 
@@ -41,8 +41,8 @@
 #### 通过符号连接（blade、bazel、Makefile、...）
 
 1. 创建目录`~/.yadcc/bin`、`~/.yadcc/symlinks`。
-2. 复制`build64_release/yadcc/client/yadcc`至`~/.yadcc/bin`。
-3. 创建软链接`~/.yadcc/symlinks/{c++,g++,gcc}`至`~/.yadcc/bin/yadcc`。
+2. 复制`build64_release/yadcc/client/cxx/yadcc-cxx`至`~/.yadcc/bin`。
+3. 创建软链接`~/.yadcc/symlinks/{c++,g++,gcc}`至`~/.yadcc/bin/yadcc-cxx`。
 4. 将`~/.yadcc/symlinks`加入`PATH`的头部。
 
 执行完毕上述操作之后`which gcc`应当输出类似于`~/.yadcc/symlinks/gcc`的结果。
