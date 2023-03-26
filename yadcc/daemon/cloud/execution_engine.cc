@@ -70,15 +70,32 @@ constexpr auto kDefaultNiceLevel = 5;
 
 namespace {
 
+// See if CGroups are applied to limit processor / memory resources. Returns
+// `true` if any such contraint is detected.
 bool IsCGroupPresent() {
   std::ifstream ifs("/proc/self/cgroup");
   std::string s((std::istreambuf_iterator<char>(ifs)),
                 std::istreambuf_iterator<char>());
   FLARE_CHECK(ifs, "Failed to open [/proc/self/cgroup].");
 
+  // FIXME: CGroups v2 uses a different format, which we currently are not able
+  // to handle.
+  //
+  // @sa: https://man7.org/linux/man-pages/man7/cgroups.7.html
+  if (flare::StartsWith(s, "0::")) {
+    FLARE_LOG_INFO(
+        "CGroups v2 is detected but for the moment we are not able to parse "
+        "its settings. As we can't tell if CPU / memory is limited by CGroups, "
+        "to avoid unexpected resource oversubscription, we won't dispatch "
+        "compilation task to this node. You can override this behavior by "
+        "specifying `max_remote_tasks` manually.");
+    // Better safe than sorry, go as if processor / memory limit is present.
+    return true;
+  }
+
   auto splitted = flare::Split(s, "\n");
   for (auto&& e : splitted) {
-    auto parts = flare::Split(e, ":");
+    auto parts = flare::Split(e, ":", true);
     FLARE_CHECK_GE(parts.size(), 3, "Unexpected cgroup setting: {}", e);
     if ((parts[1] == "cpuacct,cpu" || parts[1] == "memory") &&
         (parts[2] != "/" && parts[2] != "/user.slice")) {
@@ -107,8 +124,8 @@ ExecutionEngine::ExecutionEngine()
   if (FLAGS_max_remote_tasks == -1) {
     if (FLAGS_servant_priority == "dedicated") {
       // Don't try to achieve 100% CPU usage. In our deployment environment
-      // beforing achieving that high CPU utilization we'll likely use up all
-      // the memory.
+      // before achieving that high CPU utilization we'll likely use up all the
+      // memory.
       //
       // TODO(luobogao): Introduce `FLAGS_expected_memory_usage_per_job` to
       // address this issue (to some degree).
